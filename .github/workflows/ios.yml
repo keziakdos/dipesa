@@ -1,0 +1,39 @@
+name: Build iOS
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # Permet de lancer la compilation manuellement depuis le site
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      # 1. Récupère votre code source sur la machine virtuelle Mac
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Installe Flutter sur le Mac virtuel
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      # 3. Récupère les dépendances Flutter
+      - name: Install dependencies
+        run: flutter pub get
+
+      # 4. Compile l'application iOS (sans signature de certificat Apple)
+      - name: Build iOS Application
+        run: flutter build ios --release --no-codesign
+
+      # 5. Récupère le livrable généré et le rend téléchargeable sur GitHub
+      - name: Upload Runner artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Runner-app
+          path: build/ios/iphoneos/Runner.app
