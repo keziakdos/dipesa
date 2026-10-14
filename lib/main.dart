@@ -4530,6 +4530,7 @@ class _HomeState extends State<Home> {
           ),
         ],
       );
+  }
 
   Widget budgetsPage() {
     final total = s.monthly('expense', month, scope: scopeFilter);
