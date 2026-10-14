@@ -320,4 +320,125 @@ void main() {
       store.validate();
     });
   });
+
+  group('Indicateurs et écrans (phase 4)', () {
+    BudgetStore mixedStore() {
+      final store = BudgetStore();
+      store.seed();
+      store.accounts.addAll([
+        Account('cc', 'Courant', 'bank', 0, scope: 'personal'),
+        Account('ep', 'Livret', 'savings', 0, scope: 'personal'),
+        Account('jc', 'Commun courant', 'bank', 0, scope: 'joint'),
+        Account('carte', 'Carte', 'credit', 100000, scope: 'personal'),
+        Account('pret', 'Prêt maison', 'loan', 0, scope: 'personal'),
+      ]);
+      store.entries.addAll([
+        Entry(
+            id: 'a1',
+            kind: 'adjustment',
+            account: 'cc',
+            amount: 100000,
+            date: DateTime(2026, 9, 1),
+            scope: 'personal'),
+        Entry(
+            id: 'a2',
+            kind: 'adjustment',
+            account: 'ep',
+            amount: 50000,
+            date: DateTime(2026, 9, 1),
+            scope: 'personal'),
+        Entry(
+            id: 'a3',
+            kind: 'adjustment',
+            account: 'jc',
+            amount: 80000,
+            date: DateTime(2026, 9, 1),
+            scope: 'joint'),
+        Entry(
+            id: 'a4',
+            kind: 'adjustment',
+            account: 'carte',
+            amount: -20000,
+            date: DateTime(2026, 9, 1),
+            scope: 'personal'),
+        Entry(
+            id: 'a5',
+            kind: 'adjustment',
+            account: 'pret',
+            amount: -150000,
+            date: DateTime(2026, 9, 1),
+            scope: 'personal'),
+      ]);
+      return store;
+    }
+
+    test('intitulés validés : disponible, épargné, liquidités', () {
+      final store = mixedStore();
+      expect(store.checkingFor('personal'), 100000);
+      expect(store.savingsFor('personal'), 50000);
+      // Total liquidités = courants + épargne (+ espèces), jamais le crédit.
+      expect(store.liquidFor('personal'), 150000);
+      expect(store.liquidFor('joint'), 80000);
+      expect(store.liquidFor('all'), 230000);
+      // Dettes séparées, non soustraites des liquidités.
+      expect(store.debts, 170000);
+      store.validate();
+    });
+
+    test('migration v2 → v3 : scope projet par défaut', () {
+      final store = BudgetStore();
+      final v2 = {
+        'version': 2,
+        'accounts': [],
+        'categories': [],
+        'entries': [],
+        'projects': [
+          {
+            'id': 'p1',
+            'name': 'Chauffage',
+            'icon': 'pig',
+            'color': 'mint',
+            'target': 100000,
+            'deadline': null,
+          },
+        ],
+        'allocations': [],
+        'contributions': [],
+        'budgets': <String, int>{},
+      };
+      store.load(v2);
+      expect(store.projects.single.scope, 'personal');
+      store.validate();
+    });
+
+    test('projets : courants uniquement + périmètre', () {
+      final store = mixedStore();
+      store.projects.add(Project(
+        'p1',
+        'Chauffage',
+        'pig',
+        'mint',
+        60000,
+        null,
+        scope: 'personal',
+      ));
+      // Disponible projets = courants personnels − réservations.
+      expect(store.projectAvailableFor('personal'), 100000);
+      store.allocations.add(Allocation('p1', 40000, DateTime(2026, 10, 1)));
+      expect(store.reservedFor('personal'), 40000);
+      expect(store.projectAvailableFor('personal'), 60000);
+      // Dépense épargne liée à un projet refusée (courants uniquement).
+      store.entries.add(Entry(
+        id: 'bad',
+        kind: 'expense',
+        account: 'ep',
+        category: store.categories.first.id,
+        project: 'p1',
+        amount: 1000,
+        date: DateTime(2026, 10, 2),
+        scope: 'personal',
+      ));
+      expect(() => store.validate(), throwsException);
+    });
+  });
 }

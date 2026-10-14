@@ -24,8 +24,12 @@ const accountTypes = <String, String>{
   'savings': 'Épargne',
   'cash': 'Espèces',
   'credit': 'Carte de crédit',
+  'loan': 'Crédit (maison, voiture, autre)',
   'prepaid': 'Portefeuille prépayé',
   'investment': 'Placement — valeur manuelle',
+  'crypto': 'BTC / cryptoactifs — valeur manuelle',
+  'stocks': 'Actions — valeur manuelle',
+  'realestate': 'Immobilier — valeur manuelle',
 };
 
 const scopes = <String, String>{
@@ -344,6 +348,7 @@ class Project {
   final String color;
   final int target;
   final DateTime? deadline;
+  final String scope;
 
   Project(
     this.id,
@@ -351,8 +356,9 @@ class Project {
     this.icon,
     this.color,
     this.target,
-    this.deadline,
-  );
+    this.deadline, {
+    this.scope = 'personal',
+  });
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -361,6 +367,7 @@ class Project {
         'color': color,
         'target': target,
         'deadline': deadline == null ? null : dateText(deadline!),
+        'scope': scope,
       };
 
   factory Project.fromJson(Map<String, dynamic> j) => Project(
@@ -370,6 +377,7 @@ class Project {
         j['color'] as String,
         j['target'] as int,
         j['deadline'] == null ? null : parseDate(j['deadline'] as String),
+        scope: (j['scope'] as String?) ?? 'personal',
       );
 }
 
@@ -478,12 +486,12 @@ class BudgetStore extends ChangeNotifier {
     key = SecretKey(base64Decode(encodedKey));
 
     if (await file.exists()) {
-      // Protection P2 : copie chiffrée telle quelle avant toute migration.
+      // Protection : copie chiffrée telle quelle avant toute migration.
       final raw = await file.readAsString();
       final envelope = jsonMap(jsonDecode(raw));
       final bytes = await decrypt(envelope, key);
       final data = jsonMap(jsonDecode(utf8.decode(bytes)));
-      if ((data['version'] as int?) == 1) {
+      if ((data['version'] as int?) != 3) {
         final backupFile =
             File('${file.path}.bak-${DateTime.now().millisecondsSinceEpoch}');
         await backupFile.writeAsString(raw, flush: true);
@@ -525,7 +533,7 @@ class BudgetStore extends ChangeNotifier {
   }
 
   Map<String, dynamic> toJson() => {
-        'version': 2,
+        'version': 3,
         'accounts': accounts.map((e) => e.toJson()).toList(),
         'categories': categories.map((e) => e.toJson()).toList(),
         'entries': entries.map((e) => e.toJson()).toList(),
@@ -589,12 +597,31 @@ class BudgetStore extends ChangeNotifier {
     };
   }
 
+  /// Migration v2 → v3 : périmètre des projets. Ne supprime rien.
+  Map<String, dynamic> migrateV2ToV3(Map<String, dynamic> old) {
+    final projectsJson = (old['projects'] as List)
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    for (final p in projectsJson) {
+      p['scope'] ??= 'personal';
+    }
+    return {
+      ...old,
+      'version': 3,
+      'projects': projectsJson,
+      'contributions': old['contributions'] ?? [],
+    };
+  }
+
   void load(Map<String, dynamic> j) {
     var data = j;
     if (data['version'] == 1) {
       data = migrateV1ToV2(data);
     }
-    if (data['version'] != 2) {
+    if (data['version'] == 2) {
+      data = migrateV2ToV3(data);
+    }
+    if (data['version'] != 3) {
       throw Exception('Version de sauvegarde non prise en charge.');
     }
     accounts = (data['accounts'] as List)
@@ -676,6 +703,22 @@ class BudgetStore extends ChangeNotifier {
   int netFor(String filter) =>
       inScope(filter).fold(0, (sum, a) => sum + balance(a));
 
+  /// Argent disponible = soldes des comptes courants du périmètre.
+  int checkingFor(String filter) => inScope(filter)
+      .where((a) => a.type == 'bank')
+      .fold(0, (sum, a) => sum + balance(a));
+
+  /// Argent épargné = soldes des comptes d'épargne du périmètre.
+  int savingsFor(String filter) => inScope(filter)
+      .where((a) => a.type == 'savings')
+      .fold(0, (sum, a) => sum + balance(a));
+
+  int cashFor(String filter) => inScope(filter)
+      .where((a) => a.type == 'cash')
+      .fold(0, (sum, a) => sum + balance(a));
+
+  /// Total liquidités = courants + épargne (+ espèces).
+  /// Le crédit disponible d'une carte n'y est jamais inclus.
   int liquidFor(String filter) => inScope(filter)
       .where(liquid)
       .fold(0, (sum, a) => sum + balance(a));
@@ -705,10 +748,19 @@ class BudgetStore extends ChangeNotifier {
 
   int reserved(Project p) => funded(p) - spent(p);
 
+  int reservedFor(String filter) => projects
+      .where((p) => filter == 'all' || p.scope == filter)
+      .fold(0, (sum, p) => sum + reserved(p));
+
   int get totalReserved =>
       projects.fold(0, (sum, p) => sum + reserved(p));
 
   int get available => liquidTotal - totalReserved;
+
+  /// Disponible pour les projets = comptes courants admissibles
+  /// moins réservations actives du périmètre.
+  int projectAvailableFor(String filter) =>
+      checkingFor(filter) - reservedFor(filter);
 
   int monthly(
     String kind,
@@ -1131,10 +1183,9 @@ class BudgetStore extends ChangeNotifier {
       if (e.project != null) {
         if (!projectIds.contains(e.project) ||
             e.kind != 'expense' ||
-            !liquid(account(e.account))) {
+            account(e.account).type != 'bank') {
           throw Exception(
-            'Une dépense de projet doit utiliser un compte courant, '
-            'épargne ou espèces.',
+            'Une dépense de projet doit utiliser un compte courant.',
           );
         }
       }
@@ -1172,6 +1223,9 @@ class BudgetStore extends ChangeNotifier {
     }
 
     for (final p in projects) {
+      if (!scopes.containsKey(p.scope)) {
+        throw Exception('Périmètre de projet invalide.');
+      }
       if (p.target <= 0 || reserved(p) < 0) {
         throw Exception(
           'La tirelire doit être suffisamment alimentée pour cette dépense.',
@@ -1549,7 +1603,7 @@ Future<Map<String, String>?> ask(
     builder: (dialogContext) => AlertDialog(
       title: Text(title),
       content: SizedBox(
-        width: 420,
+        width: double.maxFinite,
         child: Form(
           key: form,
           child: SingleChildScrollView(
@@ -1750,8 +1804,12 @@ class _HomeState extends State<Home> {
         'savings' => Icons.savings_rounded,
         'cash' => Icons.payments_rounded,
         'credit' => Icons.credit_card_rounded,
+        'loan' => Icons.home_work_outlined,
         'prepaid' => Icons.account_balance_wallet_rounded,
         'investment' => Icons.trending_up_rounded,
+        'crypto' => Icons.currency_bitcoin_rounded,
+        'stocks' => Icons.candlestick_chart_rounded,
+        'realestate' => Icons.house_rounded,
         _ => Icons.account_balance_rounded,
       };
 
@@ -1762,7 +1820,7 @@ class _HomeState extends State<Home> {
       const Question('scope', 'Périmètre', initial: 'personal', options: scopes),
       const Question(
         'balance',
-        'Solde initial en € / montant dû si carte',
+        'Solde initial en € / montant dû si carte ou crédit',
         initial: '0',
         numeric: true,
       ),
@@ -1782,11 +1840,15 @@ class _HomeState extends State<Home> {
 
     await run(() => s.change(() {
           final type = result['type']!;
-          var initial = money(result['balance']!, signed: type != 'credit');
+          final debtLike = type == 'credit' || type == 'loan';
+          var initial = money(result['balance']!, signed: !debtLike);
           final limit = type == 'credit' ? money(result['limit']!) : 0;
 
           if (type == 'credit') {
             if (limit <= 0) throw Exception('Indiquez le plafond de la carte.');
+            initial = -initial;
+          }
+          if (type == 'loan') {
             initial = -initial;
           }
 
@@ -1906,10 +1968,12 @@ class _HomeState extends State<Home> {
           if (amount <= 0) throw Exception('Le montant doit être positif.');
 
           final source = s.account(result['account']!);
-          if (source.type == 'investment') {
+          if (kind != 'transfer' &&
+              ['investment', 'crypto', 'stocks', 'realestate']
+                  .contains(source.type)) {
             throw Exception(
-              'Utilisez un transfert pour investir, puis ajustez '
-              'la valorisation depuis le compte de placement.',
+              'Utilisez un transfert pour alimenter ce placement, puis ajustez '
+              'la valorisation depuis le compte.',
             );
           }
 
@@ -1918,6 +1982,7 @@ class _HomeState extends State<Home> {
               ? s.account(result['destination']!).scope
               : (result['scope'] ?? source.scope);
           final entryAuthor = result['author'] ?? 'me';
+          final entryDate = parseDate(result['date']!);
           s.entries.add(Entry(
             id: id(),
             kind: kind,
@@ -1926,12 +1991,18 @@ class _HomeState extends State<Home> {
             category: result['category'],
             project: project == null || project.isEmpty ? null : project,
             amount: amount,
-            date: parseDate(result['date']!),
+            date: entryDate,
             note: result['note'] ?? '',
             scope: entryScope,
             author: entryAuthor,
           ));
+          // Si opération passée : bascule le mois affiché pour recalculer
+          // budgets et vues concernées.
+          if (!sameMonth(entryDate, month)) {
+            month = DateTime(entryDate.year, entryDate.month);
+          }
         }));
+    if (mounted) setState(() {});
   }
 
   Future<void> quickAdd() async {
@@ -1993,8 +2064,10 @@ class _HomeState extends State<Home> {
                 color: blue,
               ),
             ),
-      title: Text(name),
-      subtitle: Text(subtitle),
+      title: Text(name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis),
+      subtitle: Text(subtitle, maxLines: 2, overflow: TextOverflow.ellipsis),
       trailing: Text(
         '${transfer ? "↔ " : signed > 0 ? "+" : ""}${euro(signed)}',
         style: TextStyle(
@@ -2113,9 +2186,13 @@ class _HomeState extends State<Home> {
       final result = await ask(context, 'Actualiser ${a.name}', [
         Question(
           'balance',
-          a.type == 'credit' ? 'Nouveau montant dû en €' : 'Nouveau solde en €',
+          a.type == 'credit' || a.type == 'loan'
+              ? 'Nouveau montant dû en €'
+              : 'Nouveau solde en €',
           initial: amountText(
-            a.type == 'credit' ? max(0, -s.balance(a)) : s.balance(a),
+            a.type == 'credit' || a.type == 'loan'
+                ? max(0, -s.balance(a))
+                : s.balance(a),
           ),
           numeric: true,
         ),
@@ -2123,11 +2200,12 @@ class _HomeState extends State<Home> {
       ]);
       if (result == null) return;
       await run(() => s.change(() {
+            final debtLike = a.type == 'credit' || a.type == 'loan';
             var value = money(
               result['balance']!,
-              signed: a.type != 'credit',
+              signed: !debtLike,
             );
-            if (a.type == 'credit') value = -value;
+            if (debtLike) value = -value;
 
             s.entries.add(Entry(
               id: id(),
@@ -2136,6 +2214,7 @@ class _HomeState extends State<Home> {
               amount: value - s.balance(a),
               date: DateTime.now(),
               note: result['note']!,
+              scope: a.scope,
             ));
           }));
     }
@@ -2186,6 +2265,7 @@ class _HomeState extends State<Home> {
   Future<void> addProject() async {
     final result = await ask(context, 'Créer une tirelire', [
       const Question('name', 'Projet — ex. Nouveau chauffage'),
+      const Question('scope', 'Périmètre', initial: 'personal', options: scopes),
       const Question('target', 'Objectif en €', numeric: true),
       const Question(
         'date',
@@ -2210,6 +2290,7 @@ class _HomeState extends State<Home> {
             result['color']!,
             money(result['target']!),
             deadline,
+            scope: result['scope']!,
           ));
         }));
   }
@@ -2223,7 +2304,7 @@ class _HomeState extends State<Home> {
           'amount',
           remove
               ? 'Montant — réservé : ${euro(s.reserved(p))}'
-              : 'Montant — non réservé : ${euro(s.available)}',
+              : 'Montant — disponible projets (${scopes[p.scope]}) : ${euro(s.projectAvailableFor(p.scope))}',
           numeric: true,
         ),
       ],
@@ -2233,10 +2314,10 @@ class _HomeState extends State<Home> {
     await run(() => s.change(() {
           final amount = money(result['amount']!);
           if (amount <= 0) throw Exception('Indiquez un montant positif.');
-          if (!remove && amount > s.available) {
+          if (!remove && amount > s.projectAvailableFor(p.scope)) {
             throw Exception(
-              'Fonds non réservés insuffisants sur les comptes '
-              'courants, épargne et espèces.',
+              'Comptes courants ${scopes[p.scope]} insuffisants : '
+              'réservation virtuelle impossible au-delà du disponible projets.',
             );
           }
           if (remove && amount > s.reserved(p)) {
@@ -2656,7 +2737,6 @@ class _HomeState extends State<Home> {
   Widget dashboard() {
     final expenses = s.monthly('expense', month, scope: scopeFilter);
     final income = s.monthly('income', month, scope: scopeFilter);
-    final limit = s.budget(month);
 
     return Column(
       children: [
@@ -2670,7 +2750,7 @@ class _HomeState extends State<Home> {
                       const TextStyle(letterSpacing: 1.5, color: ink)),
               const SizedBox(height: 8),
               Text(
-                euro(s.liquidFor(scopeFilter)),
+                euro(s.checkingFor(scopeFilter)),
                 style: const TextStyle(
                   fontSize: 34,
                   fontWeight: FontWeight.w800,
@@ -2679,8 +2759,13 @@ class _HomeState extends State<Home> {
               ),
               const SizedBox(height: 8),
               Text(
-                'Périmètre : $scopeLabel · Personnel et Commun présentés séparément dans Comptes',
+                'Argent épargné : ${euro(s.savingsFor(scopeFilter))} · '
+                'Périmètre : $scopeLabel',
                 style: const TextStyle(fontSize: 12, color: Colors.black54),
+              ),
+              const Text(
+                'Argent disponible = comptes courants. Le disponible des cartes n’est jamais compté.',
+                style: TextStyle(fontSize: 12, color: Colors.black54),
               ),
               const SizedBox(height: 18),
               SizedBox(
@@ -2731,26 +2816,6 @@ class _HomeState extends State<Home> {
             ),
           ],
         ),
-        panel(Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            heading('Budget du mois'),
-            if (limit == 0)
-              TextButton(
-                onPressed: () => editBudget(),
-                child: const Text('Définir mon budget'),
-              )
-            else ...[
-              Text('${euro(expenses)} / ${euro(limit)}'),
-              const SizedBox(height: 12),
-              progress(expenses, limit, blue),
-              const SizedBox(height: 12),
-              Text(expenses <= limit
-                  ? '${euro(limit - expenses)} encore disponibles'
-                  : 'Dépassement de ${euro(expenses - limit)}'),
-            ],
-          ],
-        )),
         if (s.available < 0)
           panel(
             Text(
@@ -2817,7 +2882,7 @@ class _HomeState extends State<Home> {
                     ),
                   ),
                   Text(
-                    a.type == 'credit'
+                    a.type == 'credit' || a.type == 'loan'
                         ? '${euro(max(0, -balance))} dus'
                         : euro(balance),
                     style: const TextStyle(fontWeight: FontWeight.w800),
@@ -2835,14 +2900,50 @@ class _HomeState extends State<Home> {
                 if (balance > 0)
                   Text('Solde créditeur : ${euro(balance)}'),
               ],
+              if (a.type == 'loan') ...[
+                const SizedBox(height: 8),
+                const Text(
+                  'Capital restant dû présenté séparément du patrimoine liquide.',
+                  style: TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              ],
             ],
           ),
         ),
       );
     }
 
-    final personal = s.accounts.where((a) => a.scope == 'personal').toList();
-    final joint = s.accounts.where((a) => a.scope == 'joint').toList();
+    String typeSummary(List<Account> list) {
+      int sum(String type) =>
+          list.where((a) => a.type == type).fold(0, (x, a) => x + s.balance(a));
+      return 'Courants : ${euro(sum('bank'))} · Épargne : ${euro(sum('savings'))} · '
+          'Espèces : ${euro(sum('cash'))} · Cartes dues : ${euro(max(0, -sum('credit')))} · '
+          'Crédits dus : ${euro(max(0, -sum('loan')))}';
+    }
+
+    List<Account> ordered(List<Account> list) {
+      const order = [
+        'bank',
+        'savings',
+        'cash',
+        'credit',
+        'loan',
+        'prepaid',
+        'investment',
+        'crypto',
+        'stocks',
+        'realestate'
+      ];
+      final sorted = list.toList()
+        ..sort((a, b) =>
+            order.indexOf(a.type).compareTo(order.indexOf(b.type)));
+      return sorted;
+    }
+
+    final personal = ordered(
+        s.accounts.where((a) => a.scope == 'personal').toList());
+    final joint =
+        ordered(s.accounts.where((a) => a.scope == 'joint').toList());
 
     return Column(
         children: [
@@ -2856,14 +2957,24 @@ class _HomeState extends State<Home> {
           ),
           if (s.accounts.isEmpty)
             panel(const Text('Ajoutez votre premier compte avec le bouton +.')),
-          heading('Personnel — ${euro(s.liquidFor('personal'))}'),
+          heading('Personnel — Total liquidités ${euro(s.liquidFor('personal'))}'),
           if (personal.isEmpty)
-            panel(const Text('Aucun compte personnel.')),
+            panel(const Text('Aucun compte personnel.'))
+          else
+            panel(Text(
+              typeSummary(personal),
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            )),
           ...personal.map(accountCard),
-          heading('Commun — ${euro(s.liquidFor('joint'))}'),
+          heading('Commun — Total liquidités ${euro(s.liquidFor('joint'))}'),
           if (joint.isEmpty)
             panel(const Text(
-                'Aucun compte commun. Ajoutez-le avec le bouton + puis périmètre « Commun ».')),
+                'Aucun compte commun. Ajoutez-le avec le bouton + puis périmètre « Commun ».'))
+          else
+            panel(Text(
+              typeSummary(joint),
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            )),
           ...joint.map(accountCard),
           panel(
             const Text(
@@ -2902,6 +3013,19 @@ class _HomeState extends State<Home> {
             const SizedBox(height: 12),
             Text('Mois précédent : ${euro(previousTotal)}'),
             Text('Écart : ${euro(total - previousTotal)}'),
+            if (limit > 0)
+              Text(
+                total <= limit
+                    ? 'Reste à dépenser : ${euro(limit - total)}'
+                    : 'Dépassement : ${euro(total - limit)}',
+                style: TextStyle(
+                  fontWeight: FontWeight.w700,
+                  color: total <= limit ? const Color(0xFF009A78) : Colors.red,
+                ),
+              ),
+            Text('Périmètre : $scopeLabel',
+                style:
+                    const TextStyle(fontSize: 12, color: Colors.black54)),
           ],
         )),
         heading('Répartition des dépenses'),
@@ -2995,8 +3119,13 @@ class _HomeState extends State<Home> {
     );
   }
 
-  Widget projectsPage() => Column(
+  Widget projectsPage() {
+    final visible = scopeFilter == 'all'
+        ? s.projects
+        : s.projects.where((p) => p.scope == scopeFilter).toList();
+    return Column(
         children: [
+          scopeSelector(),
           heading(
             'Projets & épargne',
             trailing: IconButton(
@@ -3008,31 +3137,34 @@ class _HomeState extends State<Home> {
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('LIQUIDITÉS NON RÉSERVÉES'),
+                Text('DISPONIBLE POUR LES PROJETS — $scopeLabel'.toUpperCase()),
                 const SizedBox(height: 8),
                 Text(
-                  euro(s.available),
+                  euro(s.projectAvailableFor(scopeFilter)),
                   style: const TextStyle(
                       fontSize: 28, fontWeight: FontWeight.w800),
                 ),
                 const SizedBox(height: 8),
-                Text('${euro(s.totalReserved)} réservés dans vos tirelires'),
+                Text(
+                    '${euro(s.reservedFor(scopeFilter))} réservés · '
+                    'Courants ${scopes[scopeFilter] ?? scopeLabel} : ${euro(s.checkingFor(scopeFilter))}'),
                 const SizedBox(height: 8),
                 const Text(
-                  'Réserver une somme ne déplace pas réellement l’argent '
-                  'et ne crée pas de dépense.',
+                  'Réserver une somme ne déplace pas réellement l’argent, '
+                  'ne crée pas de dépense et ne place rien automatiquement en épargne. '
+                  'La dépense finale se paie depuis un compte courant avec la tirelire choisie : elle libère la réservation.',
                   style: TextStyle(fontSize: 12),
                 ),
               ],
             ),
             color: mint.withOpacity(.12),
           ),
-          if (s.projects.isEmpty)
+          if (visible.isEmpty)
             panel(const Text(
               'Créez votre première tirelire : chauffage, vacances, '
               'travaux ou fonds de sécurité.',
             )),
-          ...s.projects.map((p) {
+          ...visible.map((p) {
             final funded = s.funded(p);
             final spent = s.spent(p);
             final reserved = s.reserved(p);
@@ -3064,10 +3196,20 @@ class _HomeState extends State<Home> {
                     badge(p.icon, p.color),
                     const SizedBox(width: 12),
                     Expanded(
-                      child: Text(
-                        p.name,
-                        style: const TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.w800),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            p.name,
+                            style: const TextStyle(
+                                fontSize: 18, fontWeight: FontWeight.w800),
+                          ),
+                          Text(
+                            scopes[p.scope] ?? p.scope,
+                            style: const TextStyle(
+                                fontSize: 12, color: Colors.black54),
+                          ),
+                        ],
                       ),
                     ),
                     IconButton(
@@ -3114,19 +3256,44 @@ class _HomeState extends State<Home> {
           }),
         ],
       );
+  }
 
-  Widget wealthPage() => Column(
+  Widget wealthPage() {
+    Widget typeRow(String label, IconData icon, int amount) => ListTile(
+          leading: Icon(icon, color: violet),
+          title: Text(label),
+          trailing: Text(euro(amount)),
+        );
+    int sumType(String type, [String scope = 'all']) => s.accounts
+        .where((a) =>
+            a.type == type && (scope == 'all' || a.scope == scope))
+        .fold<int>(0, (x, a) => x + s.balance(a));
+
+    return Column(
         children: [
           panel(
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Patrimoine net'),
+                Text('TOTAL LIQUIDITÉS — $scopeLabel'.toUpperCase(),
+                    style: const TextStyle(letterSpacing: 1.5, color: ink)),
                 const SizedBox(height: 8),
                 Text(
-                  euro(s.net),
+                  euro(s.liquidFor(scopeFilter)),
                   style: const TextStyle(
                       fontSize: 34, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                    'Comptes courants : ${euro(s.checkingFor(scopeFilter))} · '
+                    'Épargne : ${euro(s.savingsFor(scopeFilter))} · '
+                    'Espèces : ${euro(s.cashFor(scopeFilter))}'),
+                Text('Périmètre : $scopeLabel',
+                    style: const TextStyle(
+                        fontSize: 12, color: Colors.black54)),
+                const Text(
+                  'Les crédits (cartes, maison, voiture) ne sont jamais soustraits des liquidités : ils figurent plus bas, séparément.',
+                  style: TextStyle(fontSize: 12, color: Colors.black54),
                 ),
                 const SizedBox(height: 24),
                 SizedBox(
@@ -3146,59 +3313,95 @@ class _HomeState extends State<Home> {
             ),
             color: violet.withOpacity(.09),
           ),
+          scopeSelector(),
+          heading('Liquidités par périmètre'),
           panel(Column(
             children: [
               ListTile(
-                leading: const Icon(Icons.account_balance_wallet, color: mint),
-                title: const Text('Total des avoirs'),
-                trailing: Text(euro(s.assets)),
+                leading: const Icon(Icons.person, color: mint),
+                title: const Text('Mon argent personnel (liquidités)'),
+                trailing: Text(euro(s.liquidFor('personal'))),
               ),
               ListTile(
-                leading: const Icon(Icons.credit_card, color: violet),
-                title: const Text('Total des dettes'),
-                trailing: Text(euro(s.debts)),
+                leading: const Icon(Icons.people, color: blue),
+                title: const Text('Solde complet du compte commun'),
+                subtitle: const Text(
+                  'Présenté en entier, pas comme patrimoine personnel.',
+                  style: TextStyle(fontSize: 12),
+                ),
+                trailing: Text(euro(s.liquidFor('joint'))),
               ),
               const Divider(),
-              ...accountTypes.entries.map((type) {
-                final amount = s.accounts
-                    .where((a) => a.type == type.key)
-                    .fold<int>(0, (sum, a) => sum + s.balance(a));
-                return ListTile(
-                  title: Text(type.value),
-                  trailing: Text(euro(amount)),
-                );
-              }),
+              const ListTile(
+                title: Text(
+                  'Vue consolidée : chaque compte compté une seule fois. Un transfert interne ne change pas son total.',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+            ],
+          )),
+          heading('Comptes courants'),
+          panel(Column(children: [
+            typeRow('Personnel', Icons.person, sumType('bank', 'personal')),
+            typeRow('Commun', Icons.people, sumType('bank', 'joint')),
+          ])),
+          heading('Épargne'),
+          panel(Column(children: [
+            typeRow('Personnel', Icons.person, sumType('savings', 'personal')),
+            typeRow('Commun', Icons.people, sumType('savings', 'joint')),
+          ])),
+          heading('Crédits dus (hors liquidités)'),
+          panel(Column(
+            children: [
+              typeRow('Cartes de crédit dues',
+                  Icons.credit_card_rounded, -sumType('credit')),
+              typeRow('Maison / voiture / autres dus',
+                  Icons.home_work_outlined, -sumType('loan')),
+              const ListTile(
+                title: Text(
+                  'Capital restant dû affiché en positif ici. La valeur d’un bien (immobilier) et sa dette restent deux lignes séparées.',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
             ],
           )),
           heading(
-            'Placements',
+            'Placements & autres valeurs (manuelles)',
             trailing: TextButton(
               onPressed: addAccount,
               child: const Text('Ajouter'),
             ),
           ),
-          ...s.accounts.where((a) => a.type == 'investment').map((a) =>
-              panel(ListTile(
-                leading: const Icon(Icons.trending_up, color: violet),
-                title: Text(a.name),
-                subtitle: const Text('Valorisation manuelle en euros'),
-                trailing: Text(euro(s.balance(a))),
-                onTap: () => accountActions(a),
-              ))),
+          ...s.accounts
+              .where((a) => [
+                    'investment',
+                    'crypto',
+                    'stocks',
+                    'realestate'
+                  ].contains(a.type))
+              .map((a) => panel(ListTile(
+                    leading: Icon(accountIcon(a), color: violet),
+                    title: Text(a.name),
+                    subtitle: Text(
+                        '${accountTypes[a.type]} · ${scopes[a.scope] ?? ''} · valorisation manuelle, sans cours de marché'),
+                    trailing: Text(euro(s.balance(a))),
+                    onTap: () => accountActions(a),
+                  ))),
           panel(
             const Text(
-              'Un placement est suivi ici par sa valeur totale en euros. '
+              'Placements, BTC/cryptoactifs, actions et immobilier : valeur totale saisie à la main. '
               'Les versements et retraits se font par transfert. '
-              'Les variations de marché se saisissent avec '
+              'Les variations se saisissent avec '
               '« Actualiser la valeur du placement ».\n\n'
               'Ces ajustements modifient le patrimoine, mais pas '
-              'les revenus ni les dépenses du budget.\n\n'
+              'les revenus ni les dépenses du budget. Aucune valorisation automatique.\n\n'
               'Les portefeuilles prépayés sont inclus dans les avoirs : '
               'leur solde peut ne pas être remboursable.',
             ),
           ),
         ],
       );
+  }
 
   Future<void> biometricSettings() async {
     await run(() async {
