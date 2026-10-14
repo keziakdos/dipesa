@@ -199,6 +199,37 @@ List<String> pruneSnapshots(List<String> names, {int keep = 12}) {
 
 String snapshotName(int millis) => 'budget-$millis.enc';
 
+/// Formats d'export chiffré (compatibilité documentée) :
+/// - 'mon-capital-backup-1' : ancien format, toujours lisible ;
+/// - 'dipesa-backup-1' : format actuel.
+/// Un fichier déjà exporté garde son mot de passe d'origine : en changer
+/// pour un futur export ne modifie jamais les anciens fichiers.
+const currentBackupFormat = 'dipesa-backup-1';
+const legacyBackupFormat = 'mon-capital-backup-1';
+const backupFormats = [currentBackupFormat, legacyBackupFormat];
+
+/// PIN : exactement 4 chiffres. Il ne chiffre jamais les données seul :
+/// la clé de base reste aléatoire (Keychain), le PIN n'est qu'un verrou local.
+bool validPin(String pin) => RegExp(r'^\d{4}$').hasMatch(pin);
+
+const _recoveryAlphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+/// Code de récupération : 16 caractères (80 bits), présenté en 4 groupes.
+/// Il chiffre (wrap) une copie de la clé de base : sans lui, pas de
+/// rétablissement sur cet appareil ; il ne part jamais sur un autre
+/// appareil (le nouvel iPhone passe par l'export chiffré + mot de passe).
+String generateRecoveryCode() {
+  final random = Random.secure();
+  final chars = List.generate(
+      16, (_) => _recoveryAlphabet[random.nextInt(_recoveryAlphabet.length)]);
+  final raw = chars.join();
+  return '${raw.substring(0, 4)}-${raw.substring(4, 8)}-'
+      '${raw.substring(8, 12)}-${raw.substring(12, 16)}';
+}
+
+String normalizeRecoveryCode(String input) =>
+    input.toUpperCase().replaceAll(RegExp(r'[^A-Z2-9]'), '');
+
 List<int> randomBytes(int length) {
   final random = Random.secure();
   return List.generate(length, (_) => random.nextInt(256));
@@ -2025,15 +2056,16 @@ class PinGate extends StatefulWidget {
 class _PinGateState extends State<PinGate> {
   final pin = TextEditingController();
   final confirm = TextEditingController();
+  final recovery = TextEditingController();
   final auth = LocalAuthentication();
 
-  bool loading = true;
   bool busy = false;
-  bool fresh = false;
+  String step = 'loading';
   bool biometrics = false;
   String? error;
-  int failures = 0;
-  DateTime? blockedUntil;
+  String? pendingRecoveryCode;
+  bool legacyVerifier = false;
+  bool storeOpened = false;
 
   @override
   void initState() {
@@ -2043,13 +2075,102 @@ class _PinGateState extends State<PinGate> {
 
   Future<void> initialize() async {
     try {
-      fresh = await widget.store.secure.read(key: 'pin-verifier') == null;
+      final raw = await widget.store.secure.read(key: 'pin-verifier');
+      if (raw == null) {
+        step = 'createPin';
+      } else {
+        legacyVerifier = jsonMap(jsonDecode(raw))['v'] == null;
+        step = 'enterPin';
+      }
       biometrics =
           await widget.store.secure.read(key: 'biometrics') == 'true';
     } catch (_) {
       error = 'Impossible d’accéder au stockage sécurisé du téléphone.';
+      step = 'enterPin';
     }
-    if (mounted) setState(() => loading = false);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> checkBlock() async {
+    final raw = await widget.store.secure.read(key: 'pin-blocked-until');
+    if (raw != null) {
+      final until = DateTime.fromMillisecondsSinceEpoch(int.parse(raw));
+      if (DateTime.now().isBefore(until)) {
+        throw Exception(
+            'Trop d’essais. Patientez 30 secondes avant de réessayer.');
+      }
+    }
+  }
+
+  Future<void> registerFailure() async {
+    final raw = await widget.store.secure.read(key: 'pin-fails');
+    final fails = (raw == null ? 0 : int.parse(raw)) + 1;
+    if (fails >= 5) {
+      await widget.store.secure.write(key: 'pin-fails', value: '0');
+      await widget.store.secure.write(
+        key: 'pin-blocked-until',
+        value: '${DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch}',
+      );
+    } else {
+      await widget.store.secure.write(key: 'pin-fails', value: '$fails');
+    }
+  }
+
+  Future<void> resetFailures() async {
+    await widget.store.secure.delete(key: 'pin-fails');
+    await widget.store.secure.delete(key: 'pin-blocked-until');
+  }
+
+  Future<bool> checkPin(String text) async {
+    final raw = await widget.store.secure.read(key: 'pin-verifier');
+    if (raw == null) throw Exception('Configuration du PIN introuvable.');
+    final verifier = jsonMap(jsonDecode(raw));
+    final derived = await passwordKey(
+      text,
+      base64Decode(verifier['salt'] as String),
+    );
+    return constantEquals(
+      await derived.extractBytes(),
+      base64Decode(verifier['hash'] as String),
+    );
+  }
+
+  Future<void> writeVerifier(String text) async {
+    final salt = randomBytes(16);
+    final derived = await passwordKey(text, salt);
+    await widget.store.secure.write(
+      key: 'pin-verifier',
+      value: jsonEncode({
+        'v': 2,
+        'salt': base64Encode(salt),
+        'hash': base64Encode(await derived.extractBytes()),
+      }),
+    );
+  }
+
+  /// Le code de récupération chiffre une copie de la clé de base : il permet
+  /// réellement de rétablir l'accès sur CET appareil (pas un contournement).
+  /// Il ne part jamais sur un autre appareil (nouvel iPhone = export + mot de passe).
+  Future<void> writeRecoveryRecord(String code) async {
+    final encodedKey = await widget.store.secure.read(key: 'database-key');
+    if (encodedKey == null) {
+      throw Exception('Clé locale introuvable : impossible de sceller le code.');
+    }
+    final salt = randomBytes(16);
+    final wrapKey = await passwordKey(
+      normalizeRecoveryCode(code),
+      salt,
+    );
+    final envelope =
+        await encrypt(base64Decode(encodedKey), wrapKey);
+    await widget.store.secure.write(
+      key: 'pin-recovery',
+      value: jsonEncode({
+        'v': 1,
+        'salt': base64Encode(salt),
+        'wrap': envelope,
+      }),
+    );
   }
 
   Future<void> unlock({bool biometric = false}) async {
@@ -2069,56 +2190,29 @@ class _PinGateState extends State<PinGate> {
           ),
         );
         if (!accepted) return;
-      } else if (fresh) {
-        if (!RegExp(r'^\d{6}$').hasMatch(pin.text)) {
-          throw Exception('Choisissez un PIN de 6 chiffres.');
-        }
-        if (pin.text != confirm.text) {
-          throw Exception('Les deux codes ne correspondent pas.');
-        }
-
-        final salt = randomBytes(16);
-        final derived = await passwordKey(pin.text, salt);
-        await widget.store.secure.write(
-          key: 'pin-verifier',
-          value: jsonEncode({
-            'salt': base64Encode(salt),
-            'hash': base64Encode(await derived.extractBytes()),
-          }),
-        );
-        fresh = false;
-      } else {
-        if (blockedUntil != null &&
-            DateTime.now().isBefore(blockedUntil!)) {
-          throw Exception('Patientez 30 secondes avant de réessayer.');
-        }
-
-        final raw =
-            await widget.store.secure.read(key: 'pin-verifier');
-        if (raw == null) throw Exception('Configuration du PIN introuvable.');
-
-        final verifier = jsonMap(jsonDecode(raw));
-        final derived = await passwordKey(
-          pin.text,
-          base64Decode(verifier['salt'] as String),
-        );
-
-        final accepted = constantEquals(
-          await derived.extractBytes(),
-          base64Decode(verifier['hash'] as String),
-        );
-
-        if (!accepted) {
-          failures++;
-          if (failures >= 5) {
-            failures = 0;
-            blockedUntil = DateTime.now().add(const Duration(seconds: 30));
-          }
-          throw Exception('Code PIN incorrect.');
-        }
+        await widget.store.open();
+        await resetFailures();
+        if (mounted) widget.onUnlocked();
+        return;
       }
 
+      await checkBlock();
+      final accepted = await checkPin(pin.text);
+      if (!accepted) {
+        await registerFailure();
+        throw Exception('Code PIN incorrect.');
+      }
+      await resetFailures();
       await widget.store.open();
+      storeOpened = true;
+      if (legacyVerifier) {
+        // Migration sécurisée de l'ancien PIN (6 chiffres) : nouveau PIN
+        // à 4 chiffres + code de récupération avant d'entrer.
+        pin.clear();
+        confirm.clear();
+        setState(() => step = 'migratePin');
+        return;
+      }
       if (mounted) widget.onUnlocked();
     } catch (e) {
       if (mounted) {
@@ -2129,12 +2223,139 @@ class _PinGateState extends State<PinGate> {
     }
   }
 
+  Future<void> startRecoveryDisplay({bool migration = false}) async {
+    if (busy) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      if (!validPin(pin.text)) {
+        throw Exception('Choisissez un PIN de 4 chiffres.');
+      }
+      if (pin.text != confirm.text) {
+        throw Exception('Les deux codes ne correspondent pas.');
+      }
+      pendingRecoveryCode = generateRecoveryCode();
+      recovery.clear();
+      setState(() => step = 'showRecovery');
+    } catch (e) {
+      setState(() => error = cleanError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> confirmRecoveryDisplay() async {
+    if (busy || pendingRecoveryCode == null) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      if (normalizeRecoveryCode(recovery.text) !=
+          normalizeRecoveryCode(pendingRecoveryCode!)) {
+        throw Exception('Recopiez le code affiché pour prouver que vous l’avez noté.');
+      }
+      if (!storeOpened) {
+        await writeVerifier(pin.text);
+        await widget.store.open();
+        storeOpened = true;
+      } else if (legacyVerifier) {
+        await writeVerifier(pin.text);
+        legacyVerifier = false;
+      }
+      await writeRecoveryRecord(pendingRecoveryCode!);
+      pendingRecoveryCode = null;
+      if (mounted) widget.onUnlocked();
+    } catch (e) {
+      if (mounted) setState(() => error = cleanError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> recoverWithCode() async {
+    if (busy) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await checkBlock();
+      final raw = await widget.store.secure.read(key: 'pin-recovery');
+      if (raw == null) {
+        throw Exception(
+            'Aucun code de récupération sur cet appareil. Nouvel iPhone : utilisez l’export chiffré + mot de passe.');
+      }
+      final record = jsonMap(jsonDecode(raw));
+      final wrapKey = await passwordKey(
+        normalizeRecoveryCode(recovery.text),
+        base64Decode(record['salt'] as String),
+      );
+      List<int> dbKey;
+      try {
+        dbKey = await decrypt(jsonMap(record['wrap']), wrapKey);
+      } catch (_) {
+        await registerFailure();
+        throw Exception('Code de récupération incorrect.');
+      }
+      // Rétablit la clé locale (y compris si elle avait disparu), puis
+      // impose un nouveau PIN : pas de contournement, la clé fait foi.
+      await widget.store.secure
+          .write(key: 'database-key', value: base64Encode(dbKey));
+      await resetFailures();
+      await widget.store.open();
+      storeOpened = true;
+      legacyVerifier = false;
+      pin.clear();
+      confirm.clear();
+      setState(() => step = 'newPinAfterRecovery');
+    } catch (e) {
+      if (mounted) setState(() => error = cleanError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> finishNewPinAfterRecovery() async {
+    if (busy) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      if (!validPin(pin.text)) {
+        throw Exception('Choisissez un PIN de 4 chiffres.');
+      }
+      if (pin.text != confirm.text) {
+        throw Exception('Les deux codes ne correspondent pas.');
+      }
+      await writeVerifier(pin.text);
+      if (mounted) widget.onUnlocked();
+    } catch (e) {
+      if (mounted) setState(() => error = cleanError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   @override
   void dispose() {
     pin.dispose();
     confirm.dispose();
+    recovery.dispose();
     super.dispose();
   }
+
+  Widget pinField(TextEditingController c, String label) => TextField(
+        controller: c,
+        obscureText: true,
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        maxLength: 4,
+        decoration: InputDecoration(labelText: label),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -2166,63 +2387,189 @@ class _PinGateState extends State<PinGate> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  Text(fresh
-                      ? 'Créez votre code personnel'
-                      : 'Vos finances, rien qu’à vous'),
+                  Text(switch (step) {
+                    'createPin' => 'Créez votre code personnel (4 chiffres)',
+                    'showRecovery' => 'Notez votre code de récupération',
+                    'migratePin' => 'Nouveau : PIN à 4 chiffres',
+                    'recoverCode' => 'Rétablir l’accès avec le code',
+                    'newPinAfterRecovery' => 'Choisissez un nouveau PIN',
+                    _ => 'Vos finances, rien qu’à vous',
+                  }),
                   const SizedBox(height: 28),
-                  if (loading)
+                  if (step == 'loading')
                     const CircularProgressIndicator()
                   else ...[
-                    TextField(
-                      controller: pin,
-                      obscureText: true,
-                      keyboardType: TextInputType.number,
-                      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                      maxLength: 6,
-                      decoration: const InputDecoration(labelText: 'Code PIN'),
-                      onSubmitted: (_) {
-                        if (!fresh) unlock();
-                      },
-                    ),
-                    if (fresh)
-                      TextField(
-                        controller: confirm,
-                        obscureText: true,
-                        keyboardType: TextInputType.number,
-                        inputFormatters: [
-                          FilteringTextInputFormatter.digitsOnly,
-                        ],
-                        maxLength: 6,
-                        decoration: const InputDecoration(
-                          labelText: 'Confirmer le PIN',
+                    if (step == 'enterPin') ...[
+                      pinField(pin, 'Code PIN (4 chiffres)'),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text(
+                            error!,
+                            style: const TextStyle(color: Colors.red),
+                            textAlign: TextAlign.center,
+                          ),
                         ),
+                      FilledButton(
+                        onPressed: busy ? null : () => unlock(),
+                        child:
+                            Text(busy ? 'Ouverture…' : 'Déverrouiller'),
                       ),
-                    if (error != null)
-                      Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Text(
-                          error!,
-                          style: const TextStyle(color: Colors.red),
-                          textAlign: TextAlign.center,
+                      if (biometrics)
+                        TextButton.icon(
+                          onPressed: busy
+                              ? null
+                              : () => unlock(biometric: true),
+                          icon: const Icon(Icons.fingerprint_rounded),
+                          label: const Text('Face ID / biométrie'),
                         ),
-                      ),
-                    FilledButton(
-                      onPressed: busy ? null : () => unlock(),
-                      child: Text(busy
-                          ? 'Ouverture…'
-                          : fresh ? 'Créer mon espace' : 'Déverrouiller'),
-                    ),
-                    if (!fresh && biometrics)
-                      TextButton.icon(
+                      TextButton(
                         onPressed: busy
                             ? null
-                            : () => unlock(biometric: true),
-                        icon: const Icon(Icons.fingerprint_rounded),
-                        label: const Text('Face ID / biométrie'),
+                            : () {
+                                recovery.clear();
+                                setState(() {
+                                  error = null;
+                                  step = 'recoverCode';
+                                });
+                              },
+                        child: const Text('PIN oublié ? Code de récupération'),
                       ),
+                    ],
+                    if (step == 'createPin') ...[
+                      pinField(pin, 'Code PIN (4 chiffres)'),
+                      pinField(confirm, 'Confirmer le PIN'),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text(
+                            error!,
+                            style: const TextStyle(color: Colors.red),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      FilledButton(
+                        onPressed:
+                            busy ? null : () => startRecoveryDisplay(),
+                        child: Text(busy ? '…' : 'Créer mon espace'),
+                      ),
+                    ],
+                    if (step == 'migratePin') ...[
+                      const Text(
+                        'Votre ancien code est remplacé : choisissez un PIN de 4 chiffres, puis notez le code de récupération.',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      pinField(pin, 'Nouveau PIN (4 chiffres)'),
+                      pinField(confirm, 'Confirmer le PIN'),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text(
+                            error!,
+                            style: const TextStyle(color: Colors.red),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      FilledButton(
+                        onPressed:
+                            busy ? null : () => startRecoveryDisplay(migration: true),
+                        child: const Text('Continuer'),
+                      ),
+                    ],
+                    if (step == 'showRecovery') ...[
+                      panelLikeCode(),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Recopiez-le ci-dessous pour prouver que vous l’avez conservé. Il ne s’affichera plus. Sur un nouvel iPhone, utilisez l’export chiffré + son mot de passe (différent du PIN).',
+                        textAlign: TextAlign.center,
+                        style:
+                            TextStyle(fontSize: 12, color: Colors.black54),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: recovery,
+                        decoration: const InputDecoration(
+                            labelText: 'Recopier le code'),
+                      ),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text(
+                            error!,
+                            style: const TextStyle(color: Colors.red),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      FilledButton(
+                        onPressed:
+                            busy ? null : () => confirmRecoveryDisplay(),
+                        child: const Text('J’ai noté le code, entrer'),
+                      ),
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () => setState(() {
+                                  pendingRecoveryCode = null;
+                                  error = null;
+                                  step = storeOpened
+                                      ? 'migratePin'
+                                      : 'createPin';
+                                }),
+                        child: const Text('Retour'),
+                      ),
+                    ],
+                    if (step == 'recoverCode') ...[
+                      TextField(
+                        controller: recovery,
+                        decoration: const InputDecoration(
+                            labelText: 'Code de récupération'),
+                      ),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text(
+                            error!,
+                            style: const TextStyle(color: Colors.red),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      FilledButton(
+                        onPressed:
+                            busy ? null : () => recoverWithCode(),
+                        child: const Text('Rétablir l’accès'),
+                      ),
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () => setState(() {
+                                  error = null;
+                                  step = 'enterPin';
+                                }),
+                        child: const Text('Retour'),
+                      ),
+                    ],
+                    if (step == 'newPinAfterRecovery') ...[
+                      pinField(pin, 'Nouveau PIN (4 chiffres)'),
+                      pinField(confirm, 'Confirmer le PIN'),
+                      if (error != null)
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text(
+                            error!,
+                            style: const TextStyle(color: Colors.red),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      FilledButton(
+                        onPressed:
+                            busy ? null : () => finishNewPinAfterRecovery(),
+                        child: const Text('Enregistrer et entrer'),
+                      ),
+                    ],
                     const SizedBox(height: 20),
                     const Text(
-                      'Données locales chiffrées • Aucune connexion bancaire',
+                      'Données locales chiffrées • PIN ≠ mot de passe d’export • Aucune connexion bancaire',
                       textAlign: TextAlign.center,
                       style: TextStyle(fontSize: 12, color: Colors.black54),
                     ),
@@ -2235,6 +2582,25 @@ class _PinGateState extends State<PinGate> {
       ),
     );
   }
+
+  Widget panelLikeCode() => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(24),
+        ),
+        child: Text(
+          pendingRecoveryCode ?? '',
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            fontSize: 22,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 2,
+            color: ink,
+          ),
+        ),
+      );
 }
 
 String cleanError(Object error) =>
@@ -4407,7 +4773,7 @@ class _HomeState extends State<Home> {
 
   Future<void> exportBackup() async {
     final result = await ask(context, 'Sauvegarde chiffrée', [
-      const Question('password', 'Mot de passe — 12 caractères minimum',
+      const Question('password', 'Mot de passe — 8 caractères minimum',
           secret: true),
       const Question('confirm', 'Confirmer le mot de passe', secret: true),
     ]);
@@ -4415,9 +4781,11 @@ class _HomeState extends State<Home> {
 
     await run(() async {
       final password = result['password']!;
-      if (password.length < 12 || password != result['confirm']) {
+      if (password.length < 8 || password != result['confirm']) {
         throw Exception(
-          'Utilisez au moins 12 caractères et une confirmation identique.',
+          'Utilisez au moins 8 caractères et une confirmation identique. '
+          'Ce mot de passe est différent du PIN : il protège ce fichier, '
+          'qui gardera ce mot de passe même si vous en choisissez un autre plus tard.',
         );
       }
 
@@ -4428,7 +4796,7 @@ class _HomeState extends State<Home> {
         backupKey,
       );
       final envelope = {
-        'format': 'mon-capital-backup-1',
+        'format': currentBackupFormat,
         'salt': base64Encode(salt),
         'data': encrypted,
       };
@@ -4470,7 +4838,7 @@ class _HomeState extends State<Home> {
           await File(selected.path!).readAsBytes();
 
       final envelope = jsonMap(jsonDecode(utf8.decode(bytes)));
-      if (envelope['format'] != 'mon-capital-backup-1') {
+      if (!backupFormats.contains(envelope['format'])) {
         throw Exception('Ce fichier n’est pas une sauvegarde DiPeSa.');
       }
 
@@ -4624,6 +4992,93 @@ class _HomeState extends State<Home> {
     });
   }
 
+  Future<void> changePin() async {
+    final result = await ask(context, 'Changer le PIN', [
+      const Question('pin', 'Nouveau PIN (4 chiffres)', secret: true, numeric: true),
+      const Question('confirm', 'Confirmer le PIN', secret: true, numeric: true),
+    ]);
+    if (result == null) return;
+    await run(() async {
+      if (!validPin(result['pin']!)) {
+        throw Exception('Le PIN doit contenir exactement 4 chiffres.');
+      }
+      if (result['pin'] != result['confirm']) {
+        throw Exception('Les deux codes ne correspondent pas.');
+      }
+      final salt = randomBytes(16);
+      final derived = await passwordKey(result['pin']!, salt);
+      await s.secure.write(
+        key: 'pin-verifier',
+        value: jsonEncode({
+          'v': 2,
+          'salt': base64Encode(salt),
+          'hash': base64Encode(await derived.extractBytes()),
+        }),
+      );
+      message('PIN mis à jour.');
+    });
+  }
+
+  Future<void> regenerateRecovery() async {
+    final code = generateRecoveryCode();
+    final shown = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Nouveau code de récupération'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(code,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 2)),
+            const SizedBox(height: 12),
+            const Text(
+              'Notez-le maintenant : l’ancien code ne marchera plus. Il ne sert que sur cet appareil.',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Je l’ai noté'),
+          ),
+        ],
+      ),
+    );
+    if (shown != true || !mounted) return;
+    final typed = await ask(context, 'Confirmer le code', [
+      const Question('code', 'Recopiez le code affiché'),
+    ]);
+    if (typed == null) return;
+    await run(() async {
+      if (normalizeRecoveryCode(typed['code']!) !=
+          normalizeRecoveryCode(code)) {
+        throw Exception('Le code recopié ne correspond pas.');
+      }
+      final encodedKey = await s.secure.read(key: 'database-key');
+      if (encodedKey == null) throw Exception('Clé locale introuvable.');
+      final salt = randomBytes(16);
+      final wrapKey =
+          await passwordKey(normalizeRecoveryCode(code), salt);
+      final envelope = await encrypt(base64Decode(encodedKey), wrapKey);
+      await s.secure.write(
+        key: 'pin-recovery',
+        value: jsonEncode(
+            {'v': 1, 'salt': base64Encode(salt), 'wrap': envelope}),
+      );
+      message('Code de récupération remplacé.');
+    });
+  }
+
   Future<void> settings() async {
     final action = await showModalBottomSheet<String>(
       context: context,
@@ -4645,6 +5100,16 @@ class _HomeState extends State<Home> {
               leading: const Icon(Icons.category_outlined),
               title: const Text('Ajouter une catégorie et son icône'),
               onTap: () => Navigator.pop(ctx, 'category'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.pin_outlined),
+              title: const Text('Changer le PIN (4 chiffres)'),
+              onTap: () => Navigator.pop(ctx, 'pin'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.key_outlined),
+              title: const Text('Régénérer le code de récupération'),
+              onTap: () => Navigator.pop(ctx, 'recovery'),
             ),
             ListTile(
               leading: const Icon(Icons.lock_outline),
@@ -4681,6 +5146,12 @@ class _HomeState extends State<Home> {
         break;
       case 'category':
         await addCategory();
+        break;
+      case 'pin':
+        await changePin();
+        break;
+      case 'recovery':
+        await regenerateRecovery();
         break;
       case 'export':
         await exportBackup();

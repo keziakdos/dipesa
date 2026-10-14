@@ -614,4 +614,53 @@ void main() {
       expect(json['loans'], isEmpty);
     });
   });
+
+  group('Sécurité (phase 7)', () {
+    test('PIN : exactement 4 chiffres', () {
+      expect(validPin('1234'), isTrue);
+      expect(validPin('123456'), isFalse);
+      expect(validPin('123'), isFalse);
+      expect(validPin('12a4'), isFalse);
+      expect(validPin(''), isFalse);
+    });
+
+    test('code de récupération : format + normalisation', () {
+      final code = generateRecoveryCode();
+      expect(code.length, 19);
+      expect(RegExp(r'^[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$').hasMatch(code),
+          isTrue);
+      expect(normalizeRecoveryCode(code.toLowerCase().replaceAll('-', ' ')),
+          normalizeRecoveryCode(code));
+      expect(normalizeRecoveryCode(code).length, 16);
+      expect(generateRecoveryCode() != generateRecoveryCode(), isTrue);
+    });
+
+    test('wrap/unwrap de la clé : le code rétablit réellement', () async {
+      final dbKey = randomBytes(32);
+      const code = 'ABCD-EFGH-JKLM-NPQR';
+      final salt = randomBytes(16);
+      final wrapKey =
+          await passwordKey(normalizeRecoveryCode(code), salt);
+      final envelope = await encrypt(dbKey, wrapKey);
+      final reopen = await passwordKey(
+          normalizeRecoveryCode('abcd efgh jklm npqr'), salt);
+      expect(await decrypt(envelope, reopen), dbKey);
+    });
+
+    test('mauvais code : déchiffrement impossible', () async {
+      final dbKey = randomBytes(32);
+      final salt = randomBytes(16);
+      final envelope = await encrypt(
+          dbKey, await passwordKey('ABCDEFGHJKLMNPQR', salt));
+      final wrong =
+          await passwordKey('ZZZZZZZZZZZZZZZZ', salt);
+      expect(() => decrypt(envelope, wrong), throwsA(anything));
+    });
+
+    test('formats d’export : actuel + ancien acceptés', () {
+      expect(currentBackupFormat, 'dipesa-backup-1');
+      expect(backupFormats, contains(legacyBackupFormat));
+      expect(backupFormats, contains(currentBackupFormat));
+    });
+  });
 }
