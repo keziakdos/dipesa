@@ -27,16 +27,25 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # 4. Compile l'application iOS (sans signature de certificat Apple)
-      - name: Build iOS Application
-        run: flutter build ios --release --no-codesign
+      # 4. Compile l'application iOS SANS signature (Sideloadly signera ensuite
+      #    avec un compte Apple gratuit).
+      #    `flutter build ios` exige désormais une équipe de signature même avec
+      #    --no-codesign : on génère la config Flutter puis on compile
+      #    directement avec xcodebuild, signature désactivée.
+      - name: Build iOS Application (unsigned)
+        run: |
+          flutter build ios --config-only
+          (cd ios && pod install)
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/ios-unsigned CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" build
 
       # 5. Reconditionne en IPA non signé : Sideloadly le signera sur votre
       # PC avec votre compte Apple gratuit (aucun Mac requis).
       - name: Package unsigned IPA
         run: |
+          APP_PATH=$(find build/ios-unsigned/Build/Products/Release-iphoneos -maxdepth 1 -name "Runner.app" | head -n 1)
+          test -n "$APP_PATH"
           mkdir -p Payload
-          cp -R build/ios/iphoneos/Runner.app Payload/
+          cp -R "$APP_PATH" Payload/
           zip -r DiPeSa-unsigned.ipa Payload
 
       # 6. Rend les livrables téléchargeables sur GitHub (onglet Actions)
@@ -44,7 +53,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Runner-app
-          path: build/ios/iphoneos/Runner.app
+          path: build/ios-unsigned/Build/Products/Release-iphoneos/Runner.app
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
