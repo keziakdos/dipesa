@@ -182,6 +182,23 @@ String monthKey(DateTime d) =>
 bool sameMonth(DateTime a, DateTime b) =>
     a.year == b.year && a.month == b.month;
 
+/// Sauvegarde auto tous les 5 jours : pas d'exécution exacte garantie en
+/// arrière-plan sur iOS — rattrapage à chaque ouverture/écriture.
+bool shouldAutoBackup(DateTime? last, DateTime now) {
+  if (last == null) return true;
+  return now.difference(last).inHours >= 5 * 24;
+}
+
+/// Rotation : 12 snapshots conservés. La suppression du fichier principal
+/// ne supprime jamais les snapshots (dossiers/fichiers séparés).
+List<String> pruneSnapshots(List<String> names, {int keep = 12}) {
+  if (names.length <= keep) return [];
+  final sorted = names.toList()..sort();
+  return sorted.sublist(0, names.length - keep);
+}
+
+String snapshotName(int millis) => 'budget-$millis.enc';
+
 List<int> randomBytes(int length) {
   final random = Random.secure();
   return List.generate(length, (_) => random.nextInt(256));
@@ -636,6 +653,8 @@ class BudgetStore extends ChangeNotifier {
   List<Due> dues = [];
   List<Loan> loans = [];
   Map<String, int> budgets = {};
+  DateTime? lastSavedAt;
+  DateTime? lastAutoBackupAt;
 
   bool saving = false;
 
@@ -669,10 +688,62 @@ class BudgetStore extends ChangeNotifier {
       }
       load(data);
       validate();
+      final lastRaw = await secure.read(key: 'last-auto-backup');
+      lastAutoBackupAt = lastRaw == null
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(int.parse(lastRaw));
+      await snapshotIfDue();
     } else {
       seed();
       await save();
     }
+  }
+
+  Directory snapshotsDir() => Directory('${file.parent.path}/snapshots');
+
+  Future<List<File>> listSnapshots() async {
+    final dir = snapshotsDir();
+    if (!await dir.exists()) return [];
+    final files = await dir
+        .list()
+        .where((e) => e is File && e.path.endsWith('.enc'))
+        .cast<File>()
+        .toList();
+    files.sort((a, b) => b.path.compareTo(a.path));
+    return files;
+  }
+
+  /// Snapshot versionné (copie chiffrée telle quelle). Rattrapage à
+  /// l'ouverture : si > 5 jours depuis le dernier, on capture maintenant.
+  Future<void> snapshotIfDue() async {
+    try {
+      if (!await file.exists()) return;
+      if (!shouldAutoBackup(lastAutoBackupAt, DateTime.now())) return;
+      final dir = snapshotsDir();
+      await dir.create(recursive: true);
+      final name = snapshotName(DateTime.now().millisecondsSinceEpoch);
+      await File(file.path).copy('${dir.path}/$name');
+      final all = await listSnapshots();
+      for (final doomed
+          in pruneSnapshots(all.map((f) => f.path).toList())) {
+        try {
+          await File(doomed).delete();
+        } catch (_) {}
+      }
+      lastAutoBackupAt = DateTime.now();
+      await secure.write(
+        key: 'last-auto-backup',
+        value: '${lastAutoBackupAt!.millisecondsSinceEpoch}',
+      );
+    } catch (_) {
+      // La sauvegarde auto ne doit jamais bloquer l'ouverture.
+    }
+  }
+
+  Future<Map<String, dynamic>> readSnapshot(File snap) async {
+    final envelope = jsonMap(jsonDecode(await snap.readAsString()));
+    final bytes = await decrypt(envelope, key);
+    return jsonMap(jsonDecode(utf8.decode(bytes)));
   }
 
   void seed() {
@@ -845,6 +916,8 @@ class BudgetStore extends ChangeNotifier {
     final temporary = File('${file.path}.tmp');
     await temporary.writeAsString(jsonEncode(envelope), flush: true);
     await temporary.rename(file.path);
+    lastSavedAt = DateTime.now();
+    await snapshotIfDue();
   }
 
   Future<void> change(void Function() action) async {
@@ -4374,6 +4447,9 @@ class _HomeState extends State<Home> {
         sharePositionOrigin:
             box == null ? null : box.localToGlobal(Offset.zero) & box.size,
       );
+      if (!mounted) return;
+      message(
+          'Astuce : « Enregistrer dans Fichiers » → iCloud Drive pour vos autres appareils.');
     });
   }
 
@@ -4433,6 +4509,121 @@ class _HomeState extends State<Home> {
     });
   }
 
+  Future<void> backupsScreen() async {
+    final snaps = await s.listSnapshots();
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.sizeOf(ctx).height * .82,
+          child: ListView(
+            padding: const EdgeInsets.all(20),
+            children: [
+              heading('Sauvegardes et synchronisation'),
+              panel(Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('STATUT',
+                      style:
+                          TextStyle(letterSpacing: 1.5, color: ink)),
+                  const SizedBox(height: 8),
+                  Text(
+                      'Données : locales chiffrées, hors ligne OK · format v4'),
+                  Text(
+                      'Dernière écriture : ${s.lastSavedAt == null ? '—' : s.lastSavedAt.toString().substring(0, 19)}'),
+                  Text(
+                      'Dernière sauvegarde auto : ${s.lastAutoBackupAt == null ? 'jamais — sera créée à l’ouverture' : s.lastAutoBackupAt.toString().substring(0, 19)}'),
+                  Text(
+                      'Objets : ${s.accounts.length} comptes · ${s.entries.length} opérations · ${s.dues.length} échéances'),
+                  const Divider(),
+                  const Text(
+                      'Synchronisation CloudKit : non configurée. '
+                      'Pré-requis : compte développeur Apple payant + conteneur iCloud privé (jamais partagé avec un autre compte Apple). '
+                      'En attendant : export chiffré → « Enregistrer dans Fichiers » → iCloud Drive, puis import sur le nouvel iPhone.',
+                      style: TextStyle(fontSize: 12, color: Colors.black54)),
+                  const Text(
+                      'Sauvegarde auto tous les 5 jours : iOS ne garantit pas l’exécution exacte en arrière-plan — rattrapage à chaque ouverture, dernière réussite affichée ci-dessus.',
+                      style: TextStyle(fontSize: 12, color: Colors.black54)),
+                ],
+              )),
+              heading('Snapshots versionnés (${snaps.length}/12)'),
+              if (snaps.isEmpty)
+                panel(const Text(
+                    'Aucun snapshot pour le moment. Il sera créé automatiquement.')),
+              ...snaps.map((f) {
+                final name = f.path.split('/').last;
+                return panel(
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(name,
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                      ),
+                      TextButton(
+                        onPressed: () async {
+                          Navigator.pop(ctx);
+                          await restoreSnapshot(f);
+                        },
+                        child: const Text('Restaurer'),
+                      ),
+                      IconButton(
+                        tooltip: 'Supprimer ce snapshot',
+                        onPressed: () async {
+                          final yes = await confirmAction(
+                            'Supprimer ce snapshot ?',
+                            'Les autres snapshots sont conservés.',
+                          );
+                          if (yes) {
+                            try {
+                              await f.delete();
+                            } catch (e) {
+                              message(cleanError(e));
+                              return;
+                            }
+                            if (mounted) Navigator.pop(ctx);
+                            message('Snapshot supprimé.');
+                          }
+                        },
+                        icon: const Icon(Icons.delete_outline),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+              panel(const Text(
+                'Une suppression (même synchronisée un jour) ne supprime jamais tous les snapshots : ils vivent dans un dossier séparé et la rotation n’en garde que les 12 derniers.',
+                style: TextStyle(fontSize: 12, color: Colors.black54),
+              )),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> restoreSnapshot(File snap) async {
+    await run(() async {
+      Map<String, dynamic> restored;
+      try {
+        restored = await s.readSnapshot(snap);
+      } catch (_) {
+        throw Exception('Snapshot illisible (clé locale différente ?).');
+      }
+      if (!mounted) return;
+      final confirmed = await confirmAction(
+        'Restaurer ce snapshot ?',
+        'La version actuelle sera d’abord copiée en snapshot. Les doublons sont refusés par validation.',
+      );
+      if (!confirmed) return;
+      await s.snapshotIfDue();
+      await s.change(() => s.load(restored));
+      message('Snapshot restauré.');
+    });
+  }
+
   Future<void> settings() async {
     final action = await showModalBottomSheet<String>(
       context: context,
@@ -4458,12 +4649,20 @@ class _HomeState extends State<Home> {
             ListTile(
               leading: const Icon(Icons.lock_outline),
               title: const Text('Exporter une sauvegarde chiffrée'),
+              subtitle: const Text(
+                  'Mot de passe — pour nouvel iPhone via Fichiers / iCloud Drive'),
               onTap: () => Navigator.pop(ctx, 'export'),
             ),
             ListTile(
               leading: const Icon(Icons.restore),
               title: const Text('Restaurer une sauvegarde'),
               onTap: () => Navigator.pop(ctx, 'restore'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.cloud_outlined),
+              title: const Text('Sauvegardes et synchronisation'),
+              subtitle: const Text('Versionnées locales, statut, iCloud'),
+              onTap: () => Navigator.pop(ctx, 'backups'),
             ),
             ListTile(
               leading: const Icon(Icons.logout),
@@ -4488,6 +4687,9 @@ class _HomeState extends State<Home> {
         break;
       case 'restore':
         await restoreBackup();
+        break;
+      case 'backups':
+        await backupsScreen();
         break;
       case 'lock':
         widget.onLock();

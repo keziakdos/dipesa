@@ -52,7 +52,9 @@ app.*.map.json
 *.mcb.json
 budget.enc
 budget.enc.tmp
+budget.enc.bak-*
 **/budget.enc
+**/snapshots/
 **/*.mcb
 /secrets/
 .env

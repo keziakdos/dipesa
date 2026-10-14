@@ -575,4 +575,43 @@ void main() {
       store.validate();
     });
   });
+
+  group('Sauvegardes et sync (phase 6)', () {
+    test('auto-backup tous les 5 jours + rattrapage', () {
+      final now = DateTime(2026, 10, 14, 12);
+      expect(shouldAutoBackup(null, now), isTrue);
+      expect(
+          shouldAutoBackup(now.subtract(const Duration(days: 6)), now),
+          isTrue);
+      expect(
+          shouldAutoBackup(now.subtract(const Duration(days: 4)), now),
+          isFalse);
+      expect(
+          shouldAutoBackup(now.subtract(const Duration(hours: 119)), now),
+          isFalse);
+      expect(
+          shouldAutoBackup(now.subtract(const Duration(hours: 121)), now),
+          isTrue);
+    });
+
+    test('rotation : 12 snapshots, suppression séparée', () {
+      final names =
+          List.generate(15, (i) => '/x/${snapshotName(1000 + i)}');
+      final doomed = pruneSnapshots(names);
+      expect(doomed.length, 3);
+      expect(names.length - doomed.length, 12);
+      // Les plus anciens partent en premier.
+      expect(doomed.first.endsWith(snapshotName(1000)), isTrue);
+      expect(pruneSnapshots(names.sublist(0, 12)), isEmpty);
+    });
+
+    test('toJson v4 contient dues et loans', () {
+      final store = BudgetStore();
+      store.seed();
+      final json = store.toJson();
+      expect(json['version'], 4);
+      expect(json['dues'], isEmpty);
+      expect(json['loans'], isEmpty);
+    });
+  });
 }
