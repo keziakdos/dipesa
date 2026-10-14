@@ -2542,6 +2542,94 @@ class _PinGateState extends State<PinGate> {
     super.dispose();
   }
 
+  Future<bool> confirmTwice(String t1, String m1, String t2, String m2) async {
+    final a = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text(t1),
+        content: Text(m1),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Annuler')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Continuer')),
+        ],
+      ),
+    );
+    if (a != true || !mounted) return false;
+    final b = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text(t2),
+        content: Text(m2),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Annuler')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Tout effacer')),
+        ],
+      ),
+    );
+    return b == true && mounted;
+  }
+
+  /// Réinitialisation d'usine SANS contournement : détruit le verrou, la clé
+  /// locale et les données chiffrées (les exports .mcb gardés ailleurs
+  /// survivent). À n'utiliser qu'en l'absence de code de récupération :
+  /// les données effacées sont irrécupérables.
+  Future<void> factoryReset() async {
+    if (busy) return;
+    final ok = await confirmTwice(
+      'Tout effacer et recommencer ?',
+      'Le PIN, le code de récupération, la clé locale et les données de CET appareil seront détruits. Les sauvegardes .mcb exportées ailleurs sont conservées.',
+      'Dernière confirmation',
+      'Sans code de récupération ni export, les données effacées sont définitivement perdues. Continuer ?',
+    );
+    if (!ok) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      try {
+        await widget.store.secure.deleteAll();
+      } catch (_) {}
+      try {
+        final dir = await getApplicationSupportDirectory();
+        for (final name in ['budget.enc', 'budget.enc.tmp']) {
+          try {
+            await File('${dir.path}/$name').delete();
+          } catch (_) {}
+        }
+        await for (final e in dir.list()) {
+          final base = e.path.split('/').last;
+          try {
+            if (base.startsWith('budget.enc.bak-')) {
+              await e.delete();
+            } else if (base == 'snapshots' && e is Directory) {
+              await e.delete(recursive: true);
+            }
+          } catch (_) {}
+        }
+      } catch (_) {}
+      pin.clear();
+      confirm.clear();
+      recovery.clear();
+      pendingRecoveryCode = null;
+      legacyVerifier = false;
+      storeOpened = false;
+      if (mounted) setState(() => step = 'createPin');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   Widget pinField(TextEditingController c, String label) => TextField(
         controller: c,
         obscureText: true,
@@ -2594,6 +2682,16 @@ class _PinGateState extends State<PinGate> {
                     const CircularProgressIndicator()
                   else ...[
                     if (step == 'enterPin') ...[
+                      if (legacyVerifier)
+                        const Padding(
+                          padding: EdgeInsets.only(bottom: 12),
+                          child: Text(
+                            'Ancien code accepté : saisissez votre ancien code à 6 chiffres, puis vous choisirez un code à 4 chiffres + un code de récupération.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                fontSize: 12, color: Colors.black54),
+                          ),
+                        ),
                       pinField(pin, 'Code PIN (4 chiffres)'),
                       if (error != null)
                         Padding(
@@ -2628,6 +2726,13 @@ class _PinGateState extends State<PinGate> {
                                 });
                               },
                         child: const Text('PIN oublié ? Code de récupération'),
+                      ),
+                      TextButton(
+                        onPressed: busy ? null : () => factoryReset(),
+                        child: const Text(
+                          'Tout effacer et recommencer',
+                          style: TextStyle(color: Colors.red),
+                        ),
                       ),
                     ],
                     if (step == 'createPin') ...[
