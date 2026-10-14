@@ -294,6 +294,8 @@ class ReminderService {
         tz.TZDateTime.from(d, tz.local),
         details,
         androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
       );
       n++;
     }
@@ -3040,18 +3042,30 @@ class _HomeState extends State<Home> {
         ],
       );
 
-  IconData accountIcon(Account a) => switch (a.type) {
-        'savings' => Icons.savings_rounded,
-        'cash' => Icons.payments_rounded,
-        'credit' => Icons.credit_card_rounded,
-        'loan' => Icons.home_work_outlined,
-        'prepaid' => Icons.account_balance_wallet_rounded,
-        'investment' => Icons.trending_up_rounded,
-        'crypto' => Icons.currency_bitcoin_rounded,
-        'stocks' => Icons.candlestick_chart_rounded,
-        'realestate' => Icons.house_rounded,
-        _ => Icons.account_balance_rounded,
-      };
+  IconData accountIcon(Account a) {
+    switch (a.type) {
+      case 'savings':
+        return Icons.savings_rounded;
+      case 'cash':
+        return Icons.payments_rounded;
+      case 'credit':
+        return Icons.credit_card_rounded;
+      case 'loan':
+        return Icons.home_work_outlined;
+      case 'prepaid':
+        return Icons.account_balance_wallet_rounded;
+      case 'investment':
+        return Icons.trending_up_rounded;
+      case 'crypto':
+        return Icons.currency_bitcoin_rounded;
+      case 'stocks':
+        return Icons.candlestick_chart_rounded;
+      case 'realestate':
+        return Icons.house_rounded;
+      default:
+        return Icons.account_balance_rounded;
+    }
+  }
 
   Future<void> addAccount() async {
     final result = await ask(context, 'Ajouter un compte', [
