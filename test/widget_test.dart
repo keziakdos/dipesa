@@ -183,4 +183,141 @@ void main() {
       expect(store.history(scope: 'joint').length, 2);
     });
   });
+
+  group('Contributions (phase 3)', () {
+    BudgetStore jointStore() {
+      final store = BudgetStore();
+      store.seed();
+      store.accounts.addAll([
+        Account('p', 'Perso', 'bank', 0, scope: 'personal'),
+        Account('j', 'Commun', 'bank', 0, scope: 'joint'),
+      ]);
+      store.entries.add(Entry(
+        id: 'init-p',
+        kind: 'adjustment',
+        account: 'p',
+        amount: 200000,
+        date: DateTime(2026, 9, 1),
+        scope: 'personal',
+      ));
+      return store;
+    }
+
+    test('attente ne modifie pas le solde', () {
+      final store = jointStore();
+      store.planContribution(
+        person: 'wife',
+        expected: 50000,
+        dueDate: DateTime(2026, 10, 5),
+        accountId: 'j',
+      );
+      expect(store.balance(store.account('j')), 0);
+      expect(store.contributions.single.status, 'attendu');
+      store.validate();
+    });
+
+    test('mon versement = transfert neutre au consolidé', () {
+      final store = jointStore();
+      store.planContribution(
+        person: 'me',
+        expected: 50000,
+        dueDate: DateTime(2026, 10, 5),
+        accountId: 'j',
+      );
+      final c = store.contributions.single;
+      store.confirmContributionReceived(
+        contributionId: c.id,
+        amountNow: 50000,
+        date: DateTime(2026, 10, 5),
+        sourceAccountId: 'p',
+      );
+      expect(store.balance(store.account('p')), 150000);
+      expect(store.balance(store.account('j')), 50000);
+      expect(store.net, 200000);
+      // Ni dépense ni revenu consolidé.
+      expect(store.monthly('expense', DateTime(2026, 10, 1)), 0);
+      expect(store.monthly('income', DateTime(2026, 10, 1)), 0);
+      store.validate();
+    });
+
+    test('confirmation idempotente : pas de double écriture', () {
+      final store = jointStore();
+      store.planContribution(
+        person: 'wife',
+        expected: 50000,
+        dueDate: DateTime(2026, 10, 5),
+        accountId: 'j',
+      );
+      final c = store.contributions.single;
+      store.confirmContributionReceived(
+        contributionId: c.id,
+        amountNow: 30000,
+        date: DateTime(2026, 10, 5),
+      );
+      final countAfterFirst =
+          store.entries.where((e) => e.contributionId == c.id).length;
+      store.confirmContributionReceived(
+        contributionId: store.contributions.single.id,
+        amountNow: 20000,
+        date: DateTime(2026, 10, 6),
+      );
+      final linked =
+          store.entries.where((e) => e.contributionId == c.id).toList();
+      expect(countAfterFirst, 1);
+      expect(linked.length, 1);
+      expect(linked.single.amount, 50000);
+      expect(linked.single.kind, 'income');
+      expect(store.contributions.single.status, 'reçu');
+      expect(store.balance(store.account('j')), 50000);
+      store.validate();
+    });
+
+    test('partiel puis annulation', () {
+      final store = jointStore();
+      store.planContribution(
+        person: 'wife',
+        expected: 50000,
+        dueDate: DateTime(2026, 10, 5),
+        accountId: 'j',
+      );
+      final c = store.contributions.single;
+      store.confirmContributionReceived(
+        contributionId: c.id,
+        amountNow: 20000,
+        date: DateTime(2026, 10, 5),
+      );
+      expect(store.contributions.single.status, 'partiel');
+      expect(store.balance(store.account('j')), 20000);
+      store.cancelContributionReceived(c.id);
+      expect(store.contributions.single.status, 'attendu');
+      expect(store.contributions.single.received, 0);
+      expect(store.entries.where((e) => e.contributionId == c.id), isEmpty);
+      expect(store.balance(store.account('j')), 0);
+      store.validate();
+    });
+
+    test('dépense commune 85 € par ma femme : pas de dette', () {
+      final store = jointStore();
+      store.entries.add(Entry(
+        id: 'courses',
+        kind: 'expense',
+        account: 'j',
+        category: store.categories.first.id,
+        amount: 8500,
+        date: DateTime(2026, 10, 7),
+        scope: 'joint',
+        author: 'wife',
+      ));
+      // Compte commun débité, indicateur de dépenses augmenté, rien d'autre.
+      expect(store.balance(store.account('j')), -8500);
+      expect(store.monthly('expense', DateTime(2026, 10, 1), scope: 'joint'),
+          8500);
+      expect(
+          store.monthly('expense', DateTime(2026, 10, 1),
+              scope: 'joint', author: 'wife'),
+          8500);
+      expect(store.contributions, isEmpty);
+      store.validate();
+    });
+  });
 }

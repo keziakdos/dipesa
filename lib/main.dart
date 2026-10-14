@@ -730,6 +730,301 @@ class BudgetStore extends ChangeNotifier {
   int budget(DateTime month, [String categoryId = 'all']) =>
       budgets['${monthKey(month)}:$categoryId'] ?? 0;
 
+  String homeContributionCategoryId() {
+    for (final c in categories) {
+      if (c.name.toLowerCase() == 'contribution au foyer') return c.id;
+    }
+    throw Exception('Catégorie « Contribution au foyer » introuvable.');
+  }
+
+  List<Account> get jointAccounts =>
+      accounts.where((a) => a.scope == 'joint').toList();
+
+  List<Account> get personalSourceAccounts => accounts
+      .where((a) => a.scope == 'personal' && liquid(a) && a.type != 'credit')
+      .toList();
+
+  Entry? entryForContribution(Contribution c) {
+    if (c.entryId != null) {
+      for (final e in entries) {
+        if (e.id == c.entryId) return e;
+      }
+    }
+    Entry? found;
+    for (final e in entries) {
+      if (e.contributionId == c.id) {
+        if (found != null) {
+          throw Exception(
+              'Deux écritures liées à la même contribution : corrigez avant de continuer.');
+        }
+        found = e;
+      }
+    }
+    return found;
+  }
+
+  void _replaceContribution(Contribution old, Contribution updated) {
+    final index = contributions.indexWhere((c) => c.id == old.id);
+    if (index == -1) throw Exception('Suivi de contribution introuvable.');
+    contributions[index] = updated;
+  }
+
+  String _contributionStatus(int expected, int received) {
+    if (received <= 0) return 'attendu';
+    if (received < expected) return 'partiel';
+    return 'reçu';
+  }
+
+  /// Crée une contribution attendue. Ne modifie pas les soldes.
+  void planContribution({
+    required String person,
+    required int expected,
+    required DateTime dueDate,
+    required String accountId,
+  }) {
+    if (!authors.containsKey(person)) throw Exception('Personne invalide.');
+    if (expected <= 0) throw Exception('Le montant attendu doit être positif.');
+    if (!jointAccounts.any((a) => a.id == accountId)) {
+      throw Exception('Choisissez un compte commun.');
+    }
+    contributions.add(Contribution(
+      id: id(),
+      person: person,
+      expected: expected,
+      received: 0,
+      dueDate: dueDate,
+      status: 'attendu',
+      accountId: accountId,
+    ));
+  }
+
+  /// Confirme un montant qui vient d'être reçu (partiel accepté).
+  /// Idempotent : met à jour l'écriture liée au lieu d'en créer une 2e.
+  void confirmContributionReceived({
+    required String contributionId,
+    required int amountNow,
+    required DateTime date,
+    String? sourceAccountId,
+  }) {
+    if (amountNow <= 0) throw Exception('Le montant reçu doit être positif.');
+    final c = contributions.firstWhere((x) => x.id == contributionId);
+    final total = c.received + amountNow;
+    _applyContributionTotal(
+      c,
+      total,
+      date,
+      sourceAccountId: sourceAccountId,
+    );
+  }
+
+  /// Corrige le total reçu (ex. erreur de saisie). Met à jour l'écriture.
+  void correctContributionReceived({
+    required String contributionId,
+    required int newTotal,
+    required DateTime date,
+    String? sourceAccountId,
+  }) {
+    if (newTotal < 0) throw Exception('Total invalide.');
+    final c = contributions.firstWhere((x) => x.id == contributionId);
+    _applyContributionTotal(
+      c,
+      newTotal,
+      date,
+      sourceAccountId: sourceAccountId,
+    );
+  }
+
+  void _applyContributionTotal(
+    Contribution c,
+    int total,
+    DateTime date, {
+    String? sourceAccountId,
+  }) {
+    Entry? linked;
+    try {
+      linked = entryForContribution(c);
+    } catch (_) {
+      rethrow;
+    }
+
+    if (total == 0) {
+      if (linked != null) {
+        entries.removeWhere((e) => e.id == linked!.id);
+      }
+      _replaceContribution(
+        c,
+        Contribution(
+          id: c.id,
+          person: c.person,
+          expected: c.expected,
+          received: 0,
+          dueDate: c.dueDate,
+          receivedDate: null,
+          status: 'attendu',
+          accountId: c.accountId,
+        ),
+      );
+      return;
+    }
+
+    if (c.person == 'me') {
+      if (sourceAccountId == null) {
+        throw Exception('Choisissez le compte personnel débité.');
+      }
+      final src = account(sourceAccountId);
+      if (src.scope != 'personal' || !liquid(src)) {
+        throw Exception('Le versement part d’un compte personnel liquide.');
+      }
+      if (src.id == c.accountId) {
+        throw Exception('Choisissez deux comptes différents.');
+      }
+      if (linked != null) {
+        if (linked.kind != 'transfer') {
+          throw Exception(
+              'L’écriture liée n’est pas un transfert : corrigez avant de continuer.');
+        }
+        entries.removeWhere((e) => e.id == linked!.id);
+        entries.add(Entry(
+          id: linked.id,
+          kind: 'transfer',
+          account: src.id,
+          destination: c.accountId,
+          amount: total,
+          date: date,
+          note: 'Contribution au foyer — Moi',
+          scope: 'joint',
+          author: 'me',
+          contributionId: c.id,
+        ));
+      } else {
+        final created = Entry(
+          id: id(),
+          kind: 'transfer',
+          account: src.id,
+          destination: c.accountId,
+          amount: total,
+          date: date,
+          note: 'Contribution au foyer — Moi',
+          scope: 'joint',
+          author: 'me',
+          contributionId: c.id,
+        );
+        entries.add(created);
+        linked = created;
+      }
+      _replaceContribution(
+        c,
+        Contribution(
+          id: c.id,
+          person: c.person,
+          expected: c.expected,
+          received: total,
+          dueDate: c.dueDate,
+          receivedDate: date,
+          status: _contributionStatus(c.expected, total),
+          accountId: c.accountId,
+          entryId: linked!.id,
+        ),
+      );
+      return;
+    }
+
+    // Versement de ma femme : entrée externe, pas un transfert.
+    final catId = homeContributionCategoryId();
+    if (linked != null) {
+      if (linked.kind != 'income') {
+        throw Exception(
+            'L’écriture liée n’est pas un revenu : corrigez avant de continuer.');
+      }
+      entries.removeWhere((e) => e.id == linked!.id);
+      entries.add(Entry(
+        id: linked.id,
+        kind: 'income',
+        account: c.accountId,
+        category: catId,
+        amount: total,
+        date: date,
+        note: 'Contribution au foyer — Ma femme',
+        scope: 'joint',
+        author: 'wife',
+        contributionId: c.id,
+      ));
+    } else {
+      final created = Entry(
+        id: id(),
+        kind: 'income',
+        account: c.accountId,
+        category: catId,
+        amount: total,
+        date: date,
+        note: 'Contribution au foyer — Ma femme',
+        scope: 'joint',
+        author: 'wife',
+        contributionId: c.id,
+      );
+      entries.add(created);
+      linked = created;
+    }
+    _replaceContribution(
+      c,
+      Contribution(
+        id: c.id,
+        person: c.person,
+        expected: c.expected,
+        received: total,
+        dueDate: c.dueDate,
+        receivedDate: date,
+        status: _contributionStatus(c.expected, total),
+        accountId: c.accountId,
+        entryId: linked!.id,
+      ),
+    );
+  }
+
+  /// Annule le versement : supprime l'écriture liée, revient à « attendu ».
+  void cancelContributionReceived(String contributionId) {
+    final c = contributions.firstWhere((x) => x.id == contributionId);
+    final linked = entryForContribution(c);
+    if (linked != null) {
+      entries.removeWhere((e) => e.id == linked.id);
+    }
+    _replaceContribution(
+      c,
+      Contribution(
+        id: c.id,
+        person: c.person,
+        expected: c.expected,
+        received: 0,
+        dueDate: c.dueDate,
+        receivedDate: null,
+        status: 'attendu',
+        accountId: c.accountId,
+      ),
+    );
+  }
+
+  void deleteContribution(String contributionId) {
+    final c = contributions.firstWhere((x) => x.id == contributionId);
+    if (entryForContribution(c) != null) {
+      throw Exception(
+          'Annulez d’abord le versement reçu avant de supprimer ce suivi.');
+    }
+    contributions.removeWhere((x) => x.id == contributionId);
+  }
+
+  int jointExpensesTotal(DateTime month) =>
+      monthly('expense', month, scope: 'joint');
+
+  Map<String, int> jointExpensesByCategory(DateTime month) {
+    final result = <String, int>{};
+    for (final c in categories) {
+      final amount = monthly('expense', month,
+          categoryId: c.id, scope: 'joint');
+      if (amount > 0) result[c.id] = amount;
+    }
+    return result;
+  }
+
   List<Entry> history({
     String? accountId,
     String? projectId,
@@ -1991,6 +2286,373 @@ class _HomeState extends State<Home> {
     );
   }
 
+  Future<void> addContribution() async {
+    if (s.jointAccounts.isEmpty) {
+      message('Ajoutez d’abord un compte commun (périmètre « Commun »).');
+      await addAccount();
+      return;
+    }
+    final result = await ask(context, 'Contribution attendue', [
+      const Question('person', 'Personne', initial: 'me', options: authors),
+      const Question(
+        'expected',
+        'Montant attendu en € — 50/50 par défaut, ajustez au réel',
+        numeric: true,
+      ),
+      Question(
+        'dueDate',
+        'Date prévue — AAAA-MM-JJ',
+        initial: dateText(DateTime.now()),
+      ),
+      Question(
+        'account',
+        'Compte commun crédité',
+        initial: s.jointAccounts.first.id,
+        options: {for (final a in s.jointAccounts) a.id: a.name},
+      ),
+    ]);
+    if (result == null) return;
+    await run(() => s.change(() {
+          s.planContribution(
+            person: result['person']!,
+            expected: money(result['expected']!),
+            dueDate: parseDate(result['dueDate']!),
+            accountId: result['account']!,
+          );
+        }));
+  }
+
+  Future<void> confirmContribution(Contribution c) async {
+    final questions = [
+      const Question(
+        'amount',
+        'Montant qui vient d’être reçu en € (partiel accepté)',
+        numeric: true,
+      ),
+      Question(
+        'date',
+        'Date réelle — AAAA-MM-JJ',
+        initial: dateText(DateTime.now()),
+      ),
+      if (c.person == 'me')
+        Question(
+          'source',
+          'Compte personnel débité (transfert)',
+          initial: s.personalSourceAccounts.isEmpty
+              ? ''
+              : s.personalSourceAccounts.first.id,
+          options: {
+            for (final a in s.personalSourceAccounts) a.id: a.name,
+          },
+        ),
+    ];
+    if (c.person == 'me' && s.personalSourceAccounts.isEmpty) {
+      message('Ajoutez d’abord un compte personnel liquide.');
+      return;
+    }
+    final result = await ask(context, 'Confirmer un versement reçu', questions);
+    if (result == null) return;
+    await run(() => s.change(() {
+          s.confirmContributionReceived(
+            contributionId: c.id,
+            amountNow: money(result['amount']!),
+            date: parseDate(result['date']!),
+            sourceAccountId:
+                c.person == 'me' ? result['source'] : null,
+          );
+        }));
+  }
+
+  Future<void> correctContribution(Contribution c) async {
+    final result = await ask(context, 'Corriger le total reçu', [
+      Question(
+        'total',
+        'Nouveau total reçu en € (0 = tout annuler)',
+        initial: amountText(c.received),
+        numeric: true,
+      ),
+      Question(
+        'date',
+        'Date — AAAA-MM-JJ',
+        initial: dateText(c.receivedDate ?? DateTime.now()),
+      ),
+      if (c.person == 'me' && c.received > 0)
+        Question(
+          'source',
+          'Compte personnel débité (transfert)',
+          initial: s.personalSourceAccounts.isEmpty
+              ? ''
+              : s.personalSourceAccounts.first.id,
+          options: {
+            for (final a in s.personalSourceAccounts) a.id: a.name,
+          },
+        ),
+    ]);
+    if (result == null) return;
+    await run(() => s.change(() {
+          s.correctContributionReceived(
+            contributionId: c.id,
+            newTotal: money(result['total']!),
+            date: parseDate(result['date']!),
+            sourceAccountId:
+                c.person == 'me' && c.received > 0 ? result['source'] : null,
+          );
+        }));
+  }
+
+  Future<void> contributionActions(Contribution c) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text(
+                  '${authors[c.person]} — ${euro(c.received)} / ${euro(c.expected)}'),
+              subtitle: Text(
+                  'Échéance : ${dateText(c.dueDate)} · Statut : ${c.status}'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.check_circle, color: mint),
+              title: const Text('Confirmer un versement reçu'),
+              subtitle: const Text(
+                  'Ajoute le montant au total, sans doublon d’écriture'),
+              onTap: () => Navigator.pop(ctx, 'confirm'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.edit, color: blue),
+              title: const Text('Corriger le total reçu'),
+              onTap: () => Navigator.pop(ctx, 'correct'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.undo, color: violet),
+              title: const Text('Annuler le versement'),
+              subtitle: const Text(
+                  'Supprime l’écriture liée, revient à « attendu »'),
+              onTap: () => Navigator.pop(ctx, 'cancel'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('Supprimer ce suivi'),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    switch (action) {
+      case 'confirm':
+        await confirmContribution(c);
+        break;
+      case 'correct':
+        await correctContribution(c);
+        break;
+      case 'cancel':
+        final yes = await confirmAction(
+          'Annuler ce versement ?',
+          'L’écriture liée sera supprimée et le suivi repassera à « attendu ».',
+        );
+        if (yes) {
+          await run(() =>
+              s.change(() => s.cancelContributionReceived(c.id)));
+        }
+        break;
+      case 'delete':
+        final yes = await confirmAction(
+          'Supprimer ce suivi ?',
+          'Possible uniquement si aucun versement reçu n’est lié.',
+        );
+        if (yes) {
+          await run(() => s.change(() => s.deleteContribution(c.id)));
+        }
+        break;
+    }
+  }
+
+  Widget contributionTile(Contribution c) {
+    final accountName = () {
+      try {
+        return s.account(c.accountId).name;
+      } catch (_) {
+        return 'Compte supprimé';
+      }
+    }();
+    final statusColor = switch (c.status) {
+      'reçu' => const Color(0xFF009A78),
+      'partiel' => const Color(0xFFF6B543),
+      _ => violet,
+    };
+    return panel(
+      InkWell(
+        onTap: () => contributionActions(c),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  backgroundColor: mint.withOpacity(.15),
+                  child: Icon(
+                    c.person == 'me' ? Icons.person : Icons.person_outline,
+                    color: mint,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${authors[c.person]} — ${euro(c.received)} / ${euro(c.expected)}',
+                        style: const TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                      Text(
+                        'Prévue : ${dateText(c.dueDate)}'
+                        '${c.receivedDate == null ? '' : ' · Reçue : ${dateText(c.receivedDate!)}'}'
+                        ' · $accountName',
+                        style: const TextStyle(
+                            color: Colors.black54, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: statusColor.withOpacity(.12),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    c.status,
+                    style: TextStyle(
+                        color: statusColor, fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget jointPage() {
+    final jointBalance = s.liquidFor('joint');
+    final monthExpenses = s.jointExpensesTotal(month);
+    final byCategory = s.jointExpensesByCategory(month);
+    final byMe = s.monthly('expense', month, scope: 'joint', author: 'me');
+    final byWife =
+        s.monthly('expense', month, scope: 'joint', author: 'wife');
+    final contribMe = s.contributions
+        .where((c) => c.person == 'me')
+        .fold(0, (sum, c) => sum + c.received);
+    final contribWife = s.contributions
+        .where((c) => c.person == 'wife')
+        .fold(0, (sum, c) => sum + c.received);
+    final upcoming = s.contributions
+        .where((c) => c.status != 'reçu')
+        .toList()
+      ..sort((a, b) => a.dueDate.compareTo(b.dueDate));
+
+    return Column(
+      children: [
+        panel(
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('SOLDE RÉEL DU COMPTE COMMUN',
+                  style: TextStyle(letterSpacing: 1.5, color: ink)),
+              const SizedBox(height: 8),
+              Text(
+                euro(jointBalance),
+                style: const TextStyle(
+                    fontSize: 34, fontWeight: FontWeight.w800, color: ink),
+              ),
+              const SizedBox(height: 8),
+              ...s.jointAccounts.map((a) =>
+                  Text('${a.name} : ${euro(s.balance(a))}')),
+              if (s.jointAccounts.isEmpty)
+                const Text('Aucun compte commun pour le moment.'),
+              const SizedBox(height: 8),
+              const Text(
+                'Participation 50/50 par défaut : ajustez les montants réellement versés.',
+                style: TextStyle(fontSize: 12, color: Colors.black54),
+              ),
+            ],
+          ),
+          color: mint.withOpacity(.12),
+        ),
+        heading(
+          'Contributions du mois',
+          trailing: IconButton(
+            onPressed: addContribution,
+            icon: const Icon(Icons.add_circle, color: mint),
+          ),
+        ),
+        if (s.contributions.isEmpty)
+          panel(const Text(
+              'Planifiez une contribution attendue : elle ne modifie pas le solde tant qu’elle n’est pas confirmée reçue.')),
+        ...s.contributions.map(contributionTile),
+        panel(
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Contributions reçues — Moi : ${euro(contribMe)}'),
+              Text('Contributions reçues — Ma femme : ${euro(contribWife)}'),
+              const SizedBox(height: 4),
+              const Text(
+                'Le versement de ma femme est une entrée externe « Contribution au foyer », pas votre salaire. Votre versement est un transfert depuis un compte personnel : il ne crée ni dépense ni revenu consolidé.',
+                style: TextStyle(fontSize: 12, color: Colors.black54),
+              ),
+            ],
+          ),
+        ),
+        heading('Dépenses communes — ${monthText(month)}'),
+        panel(
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Total : ${euro(monthExpenses)}',
+                  style: const TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              ...byCategory.entries.map((entry) {
+                final cat = s.category(entry.key);
+                return Text(
+                    '${cat?.name ?? 'Catégorie'} : ${euro(entry.value)}');
+              }),
+              const Divider(),
+              Text('Payées par moi : ${euro(byMe)}'),
+              Text('Payées par ma femme : ${euro(byWife)}'),
+              const SizedBox(height: 4),
+              const Text(
+                '« Payées par chacun » indique qui a réalisé les paiements, pas qui les a financés. Aucune dette n’est calculée entre partenaires.',
+                style: TextStyle(fontSize: 12, color: Colors.black54),
+              ),
+            ],
+          ),
+        ),
+        heading('Prochaines charges'),
+        if (upcoming.isEmpty)
+          panel(const Text('Rien en attente.')),
+        ...upcoming.map((c) => panel(
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                        '${authors[c.person]} — reste ${euro(c.expected - c.received)} · le ${dateText(c.dueDate)}'),
+                  ),
+                  Text(c.status,
+                      style: const TextStyle(fontWeight: FontWeight.w700)),
+                ],
+              ),
+            )),
+      ],
+    );
+  }
+
   Widget dashboard() {
     final expenses = s.monthly('expense', month, scope: scopeFilter);
     final income = s.monthly('income', month, scope: scopeFilter);
@@ -2732,6 +3394,7 @@ class _HomeState extends State<Home> {
     const titles = [
       'DiPeSa',
       'Mes comptes',
+      'Espace commun',
       'Mon budget',
       'Mes tirelires',
       'Mon patrimoine',
@@ -2760,8 +3423,9 @@ class _HomeState extends State<Home> {
               switch (tab) {
                 0 => dashboard(),
                 1 => accountsPage(),
-                2 => budgetsPage(),
-                3 => projectsPage(),
+                2 => jointPage(),
+                3 => budgetsPage(),
+                4 => projectsPage(),
                 _ => wealthPage(),
               },
             ],
@@ -2786,6 +3450,11 @@ class _HomeState extends State<Home> {
               icon: Icon(Icons.account_balance_wallet_outlined),
               selectedIcon: Icon(Icons.account_balance_wallet),
               label: 'Comptes',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.people_outline),
+              selectedIcon: Icon(Icons.people),
+              label: 'Commun',
             ),
             NavigationDestination(
               icon: Icon(Icons.pie_chart_outline),
