@@ -441,4 +441,138 @@ void main() {
       expect(() => store.validate(), throwsException);
     });
   });
+
+  group('Échéances et crédits (phase 5)', () {
+    BudgetStore loanStore() {
+      final store = BudgetStore();
+      store.seed();
+      store.accounts.addAll([
+        Account('src', 'Courant', 'bank', 0, scope: 'personal'),
+        Account('card', 'Carte', 'credit', 50000, scope: 'personal'),
+      ]);
+      store.entries.addAll([
+        Entry(
+          id: 'init',
+          kind: 'adjustment',
+          account: 'src',
+          amount: 300000,
+          date: DateTime(2026, 9, 1),
+          scope: 'personal',
+        ),
+        Entry(
+          id: 'init-card',
+          kind: 'adjustment',
+          account: 'card',
+          amount: -20000,
+          date: DateTime(2026, 9, 1),
+          scope: 'personal',
+        ),
+      ]);
+      return store;
+    }
+
+    test('prévu ne modifie pas le solde', () {
+      final store = loanStore();
+      store.planDue(
+        label: 'Électricité',
+        kind: 'bill',
+        total: 8000,
+        dueDate: DateTime(2026, 11, 5),
+        accountId: 'src',
+        scope: 'personal',
+      );
+      expect(store.balance(store.account('src')), 300000);
+      expect(store.upcomingDues().single.status, 'prévu');
+      store.validate();
+    });
+
+    test('mensualité ventilée : dette −capital, charges en dépenses', () {
+      final store = loanStore();
+      store.planLoan(
+        name: 'Maison',
+        initialAmount: 20000000,
+        startDate: DateTime(2026, 9, 1),
+        annualRate: 3.0,
+        months: 240,
+        monthly: 90000,
+        insuranceMonthly: 10000,
+        feesMonthly: 0,
+        sourceAccountId: 'src',
+        scope: 'personal',
+      );
+      final loan = store.loans.single;
+      final split = store.loanSplit(loan, 20000000);
+      final capital = split['capital']!;
+      final interest = split['interest']!;
+      expect(capital + interest, 90000);
+      store.planDue(
+        label: 'Mensualité maison',
+        kind: 'loan',
+        total: 100000,
+        capital: capital,
+        interest: interest,
+        insurance: 10000,
+        fees: 0,
+        dueDate: DateTime(2026, 10, 5),
+        accountId: 'src',
+        scope: 'personal',
+        loanId: loan.id,
+      );
+      final due = store.dues.single;
+      store.settleDue(dueId: due.id, date: DateTime(2026, 10, 5));
+      // Compte source débité du total ; dette réduite du capital seul.
+      expect(store.balance(store.account('src')), 300000 - 100000);
+      expect(store.balance(store.account(loan.debtAccountId)),
+          -20000000 + capital);
+      // Dépenses = intérêts + assurance, pas le capital.
+      expect(store.monthly('expense', DateTime(2026, 10, 1)),
+          interest + 10000);
+      // Sorties de trésorerie = paiement total.
+      expect(store.cashOut(DateTime(2026, 10, 1)), 100000);
+      // Idempotence : second appel ne rejoue rien.
+      final count = store.entries.length;
+      store.settleDue(dueId: due.id, date: DateTime(2026, 10, 5));
+      expect(store.entries.length, count);
+      store.validate();
+    });
+
+    test('carte 50 € = transfert mensuel, pas un prêt immo', () {
+      final store = loanStore();
+      store.planDue(
+        label: 'Carte 50 €',
+        kind: 'card',
+        total: 5000,
+        dueDate: DateTime(2026, 10, 5),
+        accountId: 'src',
+        scope: 'personal',
+        recurrence: 'monthly',
+      );
+      final first = store.upcomingDues().single;
+      store.settleDue(dueId: first.id, date: DateTime(2026, 10, 5));
+      expect(store.monthly('expense', DateTime(2026, 10, 1)), 0);
+      expect(store.balance(store.account('src')), 300000 - 5000);
+      expect(store.balance(store.account('card')), -20000 + 5000);
+      // Récurrence : échéance suivante générée en prévu.
+      expect(store.upcomingDues().length, 1);
+      expect(store.upcomingDues().single.dueDate.month, 11);
+      store.validate();
+    });
+
+    test('migration v3 → v4 : dues et loans vides', () {
+      final store = BudgetStore();
+      store.load({
+        'version': 3,
+        'accounts': [],
+        'categories': [],
+        'entries': [],
+        'projects': [],
+        'allocations': [],
+        'contributions': [],
+        'budgets': <String, int>{},
+      });
+      expect(store.dues, isEmpty);
+      expect(store.loans, isEmpty);
+      store.validate();
+    });
+  });
 }

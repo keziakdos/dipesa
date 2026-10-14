@@ -48,6 +48,18 @@ const authors = <String, String>{
   'wife': 'Ma femme',
 };
 
+const dueKinds = <String, String>{
+  'bill': 'Facture / mensualité',
+  'loan': 'Mensualité de crédit',
+  'card': 'Remboursement carte',
+  'other': 'Autre échéance',
+};
+
+const dueRecurrences = <String, String>{
+  'none': 'Ponctuelle',
+  'monthly': 'Mensuelle',
+};
+
 const categoryIcons = <String, IconData>{
   'salary': Icons.work_rounded,
   'home': Icons.home_rounded,
@@ -452,6 +464,163 @@ class Contribution {
       );
 }
 
+/// Échéance : facture, mensualité ou remboursement prévu.
+/// « Prévu » ne modifie jamais le solde ; « comptabilisé » crée les écritures.
+class Due {
+  final String id;
+  final String label;
+  final String kind;
+  final int total;
+  final int capital;
+  final int interest;
+  final int insurance;
+  final int fees;
+  final DateTime dueDate;
+  final String accountId;
+  final String scope;
+  final String? categoryId;
+  final String status;
+  final List<String> entryIds;
+  final String recurrence;
+  final String? loanId;
+
+  Due({
+    required this.id,
+    required this.label,
+    required this.kind,
+    required this.total,
+    required this.dueDate,
+    required this.accountId,
+    required this.scope,
+    this.categoryId,
+    this.status = 'prévu',
+    List<String>? entryIds,
+    this.recurrence = 'none',
+    this.loanId,
+    this.capital = 0,
+    this.interest = 0,
+    this.insurance = 0,
+    this.fees = 0,
+  }) : entryIds = entryIds ?? [];
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'label': label,
+        'kind': kind,
+        'total': total,
+        'capital': capital,
+        'interest': interest,
+        'insurance': insurance,
+        'fees': fees,
+        'dueDate': dateText(dueDate),
+        'accountId': accountId,
+        'scope': scope,
+        'categoryId': categoryId,
+        'status': status,
+        'entryIds': entryIds,
+        'recurrence': recurrence,
+        'loanId': loanId,
+      };
+
+  factory Due.fromJson(Map<String, dynamic> j) => Due(
+        id: j['id'] as String,
+        label: j['label'] as String,
+        kind: j['kind'] as String,
+        total: j['total'] as int,
+        capital: (j['capital'] as int?) ?? 0,
+        interest: (j['interest'] as int?) ?? 0,
+        insurance: (j['insurance'] as int?) ?? 0,
+        fees: (j['fees'] as int?) ?? 0,
+        dueDate: parseDate(j['dueDate'] as String),
+        accountId: j['accountId'] as String,
+        scope: (j['scope'] as String?) ?? 'personal',
+        categoryId: j['categoryId'] as String?,
+        status: (j['status'] as String?) ?? 'prévu',
+        entryIds:
+            ((j['entryIds'] as List?) ?? []).map((e) => e as String).toList(),
+        recurrence: (j['recurrence'] as String?) ?? 'none',
+        loanId: j['loanId'] as String?,
+      );
+}
+
+/// Crédit amortissable : les mensualités déjà incluses dans les soldes
+/// initiaux ne sont jamais rejouées. Saisir le capital restant dû à une
+/// date connue pour un crédit déjà commencé.
+class Loan {
+  final String id;
+  final String name;
+  final String debtAccountId;
+  final int initialAmount;
+  final DateTime startDate;
+  final double annualRate;
+  final int months;
+  final int monthly;
+  final int insuranceMonthly;
+  final int feesMonthly;
+  final String sourceAccountId;
+  final String scope;
+  final int? remainingDue;
+  final DateTime? remainingDate;
+  final int paidCount;
+
+  Loan({
+    required this.id,
+    required this.name,
+    required this.debtAccountId,
+    required this.initialAmount,
+    required this.startDate,
+    required this.annualRate,
+    required this.months,
+    required this.monthly,
+    required this.sourceAccountId,
+    required this.scope,
+    this.insuranceMonthly = 0,
+    this.feesMonthly = 0,
+    this.remainingDue,
+    this.remainingDate,
+    this.paidCount = 0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'debtAccountId': debtAccountId,
+        'initialAmount': initialAmount,
+        'startDate': dateText(startDate),
+        'annualRate': annualRate,
+        'months': months,
+        'monthly': monthly,
+        'insuranceMonthly': insuranceMonthly,
+        'feesMonthly': feesMonthly,
+        'sourceAccountId': sourceAccountId,
+        'scope': scope,
+        'remainingDue': remainingDue,
+        'remainingDate':
+            remainingDate == null ? null : dateText(remainingDate!),
+        'paidCount': paidCount,
+      };
+
+  factory Loan.fromJson(Map<String, dynamic> j) => Loan(
+        id: j['id'] as String,
+        name: j['name'] as String,
+        debtAccountId: j['debtAccountId'] as String,
+        initialAmount: j['initialAmount'] as int,
+        startDate: parseDate(j['startDate'] as String),
+        annualRate: (j['annualRate'] as num).toDouble(),
+        months: j['months'] as int,
+        monthly: j['monthly'] as int,
+        insuranceMonthly: (j['insuranceMonthly'] as int?) ?? 0,
+        feesMonthly: (j['feesMonthly'] as int?) ?? 0,
+        sourceAccountId: j['sourceAccountId'] as String,
+        scope: (j['scope'] as String?) ?? 'personal',
+        remainingDue: j['remainingDue'] as int?,
+        remainingDate: j['remainingDate'] == null
+            ? null
+            : parseDate(j['remainingDate'] as String),
+        paidCount: (j['paidCount'] as int?) ?? 0,
+      );
+}
+
 class BudgetStore extends ChangeNotifier {
   final FlutterSecureStorage secure = const FlutterSecureStorage();
 
@@ -464,6 +633,8 @@ class BudgetStore extends ChangeNotifier {
   List<Project> projects = [];
   List<Allocation> allocations = [];
   List<Contribution> contributions = [];
+  List<Due> dues = [];
+  List<Loan> loans = [];
   Map<String, int> budgets = {};
 
   bool saving = false;
@@ -491,7 +662,7 @@ class BudgetStore extends ChangeNotifier {
       final envelope = jsonMap(jsonDecode(raw));
       final bytes = await decrypt(envelope, key);
       final data = jsonMap(jsonDecode(utf8.decode(bytes)));
-      if ((data['version'] as int?) != 3) {
+      if ((data['version'] as int?) != 4) {
         final backupFile =
             File('${file.path}.bak-${DateTime.now().millisecondsSinceEpoch}');
         await backupFile.writeAsString(raw, flush: true);
@@ -510,6 +681,8 @@ class BudgetStore extends ChangeNotifier {
     projects = [];
     allocations = [];
     contributions = [];
+    dues = [];
+    loans = [];
     budgets = {};
 
     categories = [
@@ -533,13 +706,15 @@ class BudgetStore extends ChangeNotifier {
   }
 
   Map<String, dynamic> toJson() => {
-        'version': 3,
+        'version': 4,
         'accounts': accounts.map((e) => e.toJson()).toList(),
         'categories': categories.map((e) => e.toJson()).toList(),
         'entries': entries.map((e) => e.toJson()).toList(),
         'projects': projects.map((e) => e.toJson()).toList(),
         'allocations': allocations.map((e) => e.toJson()).toList(),
         'contributions': contributions.map((e) => e.toJson()).toList(),
+        'dues': dues.map((e) => e.toJson()).toList(),
+        'loans': loans.map((e) => e.toJson()).toList(),
         'budgets': budgets,
       };
 
@@ -613,6 +788,16 @@ class BudgetStore extends ChangeNotifier {
     };
   }
 
+  /// Migration v3 → v4 : échéances et crédits. Ne supprime rien.
+  Map<String, dynamic> migrateV3ToV4(Map<String, dynamic> old) {
+    return {
+      ...old,
+      'version': 4,
+      'dues': old['dues'] ?? [],
+      'loans': old['loans'] ?? [],
+    };
+  }
+
   void load(Map<String, dynamic> j) {
     var data = j;
     if (data['version'] == 1) {
@@ -621,7 +806,10 @@ class BudgetStore extends ChangeNotifier {
     if (data['version'] == 2) {
       data = migrateV2ToV3(data);
     }
-    if (data['version'] != 3) {
+    if (data['version'] == 3) {
+      data = migrateV3ToV4(data);
+    }
+    if (data['version'] != 4) {
       throw Exception('Version de sauvegarde non prise en charge.');
     }
     accounts = (data['accounts'] as List)
@@ -636,6 +824,10 @@ class BudgetStore extends ChangeNotifier {
         .map((e) => Allocation.fromJson(jsonMap(e))).toList();
     contributions = ((data['contributions'] as List?) ?? [])
         .map((e) => Contribution.fromJson(jsonMap(e))).toList();
+    dues = ((data['dues'] as List?) ?? [])
+        .map((e) => Due.fromJson(jsonMap(e))).toList();
+    loans = ((data['loans'] as List?) ?? [])
+        .map((e) => Loan.fromJson(jsonMap(e))).toList();
     budgets = Map<String, int>.from(data['budgets'] as Map);
     ensureHomeContributionCategory();
   }
@@ -1077,6 +1269,364 @@ class BudgetStore extends ChangeNotifier {
     return result;
   }
 
+  /// Échéances à venir (prévu), triées. Ne modifient pas les soldes.
+  List<Due> upcomingDues({String scope = 'all'}) {
+    final list = dues
+        .where((d) =>
+            d.status == 'prévu' &&
+            (scope == 'all' || d.scope == scope))
+        .toList()
+      ..sort((a, b) => a.dueDate.compareTo(b.dueDate));
+    return list;
+  }
+
+  /// Sorties de trésorerie comptabilisées sur le mois (dépenses + transferts
+  /// sortants, dont le paiement total des crédits).
+  int cashOut(DateTime month, {String scope = 'all'}) {
+    var out = monthly('expense', month, scope: scope);
+    for (final e in entries.where((e) =>
+        e.kind == 'transfer' && sameMonth(e.date, month))) {
+      if (scope != 'all') {
+        final src = account(e.account).scope;
+        if (src != scope) continue;
+      }
+      out += e.amount;
+    }
+    return out;
+  }
+
+  void planDue({
+    required String label,
+    required String kind,
+    required int total,
+    required DateTime dueDate,
+    required String accountId,
+    required String scope,
+    String? categoryId,
+    String recurrence = 'none',
+    String? loanId,
+    int capital = 0,
+    int interest = 0,
+    int insurance = 0,
+    int fees = 0,
+  }) {
+    if (!dueKinds.containsKey(kind)) throw Exception('Type d’échéance invalide.');
+    if (!dueRecurrences.containsKey(recurrence)) {
+      throw Exception('Récurrence invalide.');
+    }
+    if (total <= 0) throw Exception('Le montant doit être positif.');
+    if (capital + interest + insurance + fees != total && kind == 'loan') {
+      throw Exception(
+          'Capital + intérêts + assurance + frais doit égaler le total.');
+    }
+    account(accountId);
+    if (!scopes.containsKey(scope)) throw Exception('Périmètre invalide.');
+    dues.add(Due(
+      id: id(),
+      label: label,
+      kind: kind,
+      total: total,
+      capital: capital,
+      interest: interest,
+      insurance: insurance,
+      fees: fees,
+      dueDate: dueDate,
+      accountId: accountId,
+      scope: scope,
+      categoryId: categoryId,
+      recurrence: recurrence,
+      loanId: loanId,
+    ));
+  }
+
+  /// Comptabilise une échéance. Idempotent : si des écritures liées existent,
+  /// elles sont mises à jour, pas dupliquées. Relance la récurrence mensuelle.
+  /// DiPeSa enregistre : aucun paiement bancaire réel.
+  void settleDue({required String dueId, required DateTime date}) {
+    final index = dues.indexWhere((d) => d.id == dueId);
+    if (index == -1) throw Exception('Échéance introuvable.');
+    final d = dues[index];
+    if (d.status == 'comptabilisé' && d.entryIds.isNotEmpty) {
+      // Déjà comptabilisée : on ne rejoue rien (idempotence multi-appareils).
+      return;
+    }
+    final src = account(d.accountId);
+    final createdIds = <String>[];
+
+    if (d.kind == 'card') {
+      // Remboursement carte : transfert, pas une dépense, pas de modèle immo.
+      final card = accounts.firstWhere(
+        (a) => a.type == 'credit',
+        orElse: () => throw Exception(
+            'Créez d’abord une carte de crédit pour ce remboursement.'),
+      );
+      final t = Entry(
+        id: id(),
+        kind: 'transfer',
+        account: src.id,
+        destination: card.id,
+        amount: d.total,
+        date: date,
+        note: d.label,
+        scope: src.scope,
+        author: 'me',
+      );
+      entries.add(t);
+      createdIds.add(t.id);
+    } else if (d.kind == 'loan') {
+      // Mensualité : débit total du compte source ; la dette ne baisse que
+      // du capital ; intérêts/assurance/frais = dépenses (pas de conso).
+      Loan? loan;
+      if (d.loanId != null) {
+        for (final l in loans) {
+          if (l.id == d.loanId) loan = l;
+        }
+      }
+      final debtId = loan?.debtAccountId;
+      final debt = debtId == null
+          ? null
+          : accounts.firstWhere((a) => a.id == debtId);
+      if (d.capital > 0 && debt != null) {
+        final t = Entry(
+          id: id(),
+          kind: 'transfer',
+          account: src.id,
+          destination: debt.id,
+          amount: d.capital,
+          date: date,
+          note: '${d.label} — capital',
+          scope: d.scope,
+          author: 'me',
+        );
+        entries.add(t);
+        createdIds.add(t.id);
+      }
+      void expensePart(int part, String suffix) {
+        if (part <= 0) return;
+        final e = Entry(
+          id: id(),
+          kind: 'expense',
+          account: src.id,
+          category: d.categoryId ?? categories.first.id,
+          amount: part,
+          date: date,
+          note: '${d.label} — $suffix',
+          scope: d.scope,
+          author: 'me',
+        );
+        entries.add(e);
+        createdIds.add(e.id);
+      }
+
+      expensePart(d.interest, 'intérêts');
+      expensePart(d.insurance, 'assurance');
+      expensePart(d.fees, 'frais');
+      if (d.capital == 0 && d.interest == 0 && d.insurance == 0 && d.fees == 0) {
+        // Sans ventilation : sortie simple comptée en dépense.
+        final e = Entry(
+          id: id(),
+          kind: 'expense',
+          account: src.id,
+          category: d.categoryId ?? categories.first.id,
+          amount: d.total,
+          date: date,
+          note: d.label,
+          scope: d.scope,
+          author: 'me',
+        );
+        entries.add(e);
+        createdIds.add(e.id);
+      }
+      if (loan != null) {
+        final li = loans.indexWhere((l) => l.id == loan!.id);
+        loans[li] = Loan(
+          id: loan.id,
+          name: loan.name,
+          debtAccountId: loan.debtAccountId,
+          initialAmount: loan.initialAmount,
+          startDate: loan.startDate,
+          annualRate: loan.annualRate,
+          months: loan.months,
+          monthly: loan.monthly,
+          insuranceMonthly: loan.insuranceMonthly,
+          feesMonthly: loan.feesMonthly,
+          sourceAccountId: loan.sourceAccountId,
+          scope: loan.scope,
+          remainingDue: loan.remainingDue,
+          remainingDate: loan.remainingDate,
+          paidCount: loan.paidCount + 1,
+        );
+      }
+    } else {
+      final e = Entry(
+        id: id(),
+        kind: 'expense',
+        account: src.id,
+        category: d.categoryId ?? categories.first.id,
+        amount: d.total,
+        date: date,
+        note: d.label,
+        scope: d.scope,
+        author: 'me',
+      );
+      entries.add(e);
+      createdIds.add(e.id);
+    }
+
+    dues[index] = Due(
+      id: d.id,
+      label: d.label,
+      kind: d.kind,
+      total: d.total,
+      capital: d.capital,
+      interest: d.interest,
+      insurance: d.insurance,
+      fees: d.fees,
+      dueDate: d.dueDate,
+      accountId: d.accountId,
+      scope: d.scope,
+      categoryId: d.categoryId,
+      status: 'comptabilisé',
+      entryIds: createdIds,
+      recurrence: d.recurrence,
+      loanId: d.loanId,
+    );
+
+    // Récurrence mensuelle : génère l'échéance suivante (prévu), même total.
+    if (d.recurrence == 'monthly') {
+      final next = DateTime(d.dueDate.year, d.dueDate.month + 1, d.dueDate.day);
+      dues.add(Due(
+        id: id(),
+        label: d.label,
+        kind: d.kind,
+        total: d.total,
+        capital: d.capital,
+        interest: d.interest,
+        insurance: d.insurance,
+        fees: d.fees,
+        dueDate: next,
+        accountId: d.accountId,
+        scope: d.scope,
+        categoryId: d.categoryId,
+        recurrence: 'monthly',
+        loanId: d.loanId,
+      ));
+    }
+  }
+
+  void cancelDueSettlement(String dueId) {
+    final index = dues.indexWhere((d) => d.id == dueId);
+    if (index == -1) throw Exception('Échéance introuvable.');
+    final d = dues[index];
+    entries.removeWhere((e) => d.entryIds.contains(e.id));
+    dues[index] = Due(
+      id: d.id,
+      label: d.label,
+      kind: d.kind,
+      total: d.total,
+      capital: d.capital,
+      interest: d.interest,
+      insurance: d.insurance,
+      fees: d.fees,
+      dueDate: d.dueDate,
+      accountId: d.accountId,
+      scope: d.scope,
+      categoryId: d.categoryId,
+      status: 'prévu',
+      entryIds: [],
+      recurrence: d.recurrence,
+      loanId: d.loanId,
+    );
+  }
+
+  void deleteDue(String dueId) {
+    final d = dues.firstWhere((x) => x.id == dueId);
+    if (d.status == 'comptabilisé') {
+      throw Exception(
+          'Annulez d’abord la comptabilisation avant de supprimer.');
+    }
+    dues.removeWhere((x) => x.id == dueId);
+  }
+
+  /// Crée un crédit + son compte de dette (montant dû).
+  /// Pour un crédit déjà commencé : renseignez remainingDue/remainingDate
+  /// (ou importez l'échéancier) au lieu de rejouer les mensualités passées.
+  void planLoan({
+    required String name,
+    required int initialAmount,
+    required DateTime startDate,
+    required double annualRate,
+    required int months,
+    required int monthly,
+    required String sourceAccountId,
+    required String scope,
+    int insuranceMonthly = 0,
+    int feesMonthly = 0,
+    int? remainingDue,
+    DateTime? remainingDate,
+    String debtAccountName = '',
+  }) {
+    if (initialAmount <= 0 || months <= 0 || monthly <= 0) {
+      throw Exception('Montant, durée et mensualité doivent être positifs.');
+    }
+    if (annualRate < 0 || annualRate > 100) {
+      throw Exception('Taux annuel invalide.');
+    }
+    final bookedDate = remainingDate ?? startDate;
+    if (bookedDate.isAfter(parseDate(dateText(DateTime.now())))) {
+      throw Exception('La date de reprise ne peut pas être future.');
+    }
+    if (remainingDue != null && remainingDue <= 0) {
+      throw Exception('Capital restant dû invalide.');
+    }
+    account(sourceAccountId);
+    final debt = Account(
+      id(),
+      debtAccountName.isEmpty ? 'Crédit — $name' : debtAccountName,
+      'loan',
+      0,
+      scope: scope,
+    );
+    accounts.add(debt);
+    final due = remainingDue ?? initialAmount;
+    entries.add(Entry(
+      id: id(),
+      kind: 'adjustment',
+      account: debt.id,
+      amount: -due,
+      date: remainingDate ?? startDate,
+      note: remainingDue == null
+          ? 'Capital initial — $name'
+          : 'Capital restant dû — $name (reprise, sans rejouer le passé)',
+      scope: scope,
+    ));
+    loans.add(Loan(
+      id: id(),
+      name: name,
+      debtAccountId: debt.id,
+      initialAmount: initialAmount,
+      startDate: startDate,
+      annualRate: annualRate,
+      months: months,
+      monthly: monthly,
+      insuranceMonthly: insuranceMonthly,
+      feesMonthly: feesMonthly,
+      sourceAccountId: sourceAccountId,
+      scope: scope,
+      remainingDue: remainingDue,
+      remainingDate: remainingDate,
+    ));
+  }
+
+  /// Ventilation d'une mensualité à capital constant d'intérêts dégressifs :
+  /// intérêts du mois = restant dû × taux annuel / 12.
+  Map<String, int> loanSplit(Loan loan, int remaining) {
+    final interest =
+        ((remaining * loan.annualRate / 12 / 100).round()).clamp(0, loan.monthly);
+    final capital = (loan.monthly - interest).clamp(0, loan.monthly);
+    return {'capital': capital, 'interest': interest};
+  }
+
   List<Entry> history({
     String? accountId,
     String? projectId,
@@ -1190,7 +1740,60 @@ class BudgetStore extends ChangeNotifier {
         }
       }
       if (e.date.isAfter(DateTime.now())) {
-        throw Exception('Les opérations futures ne sont pas encore gérées.');
+        throw Exception(
+            'Opération future : utilisez une échéance (Budget / Échéances), comptabilisée à sa date.');
+      }
+    }
+
+    final dueIds = dues.map((e) => e.id).toSet();
+    final loanIds = loans.map((e) => e.id).toSet();
+    if (dueIds.length != dues.length || loanIds.length != loans.length) {
+      throw Exception('Identifiants dupliqués.');
+    }
+
+    for (final d in dues) {
+      if (!dueKinds.containsKey(d.kind) ||
+          !dueRecurrences.containsKey(d.recurrence) ||
+          !['prévu', 'comptabilisé'].contains(d.status)) {
+        throw Exception('Échéance invalide.');
+      }
+      if (!accountIds.contains(d.accountId)) {
+        throw Exception('Compte de prélèvement introuvable.');
+      }
+      if (!scopes.containsKey(d.scope)) {
+        throw Exception('Périmètre d’échéance invalide.');
+      }
+      if (d.total <= 0) throw Exception('Montant d’échéance invalide.');
+      if (d.kind == 'loan' &&
+          d.capital + d.interest + d.insurance + d.fees != d.total) {
+        throw Exception('Ventilation de mensualité incohérente.');
+      }
+      for (final eid in d.entryIds) {
+        if (!entryIds.contains(eid)) {
+          throw Exception('Écriture d’échéance introuvable.');
+        }
+      }
+      if (d.status == 'prévu' && d.entryIds.isNotEmpty) {
+        throw Exception('Échéance prévue avec écritures liées.');
+      }
+      if (d.loanId != null && !loanIds.contains(d.loanId)) {
+        throw Exception('Crédit lié introuvable.');
+      }
+    }
+
+    for (final l in loans) {
+      if (!accountIds.contains(l.debtAccountId) ||
+          !accountIds.contains(l.sourceAccountId)) {
+        throw Exception('Comptes du crédit introuvables.');
+      }
+      if (account(l.debtAccountId).type != 'loan') {
+        throw Exception('Le compte de dette doit être un crédit.');
+      }
+      if (!scopes.containsKey(l.scope)) {
+        throw Exception('Périmètre de crédit invalide.');
+      }
+      if (l.initialAmount <= 0 || l.months <= 0 || l.monthly <= 0) {
+        throw Exception('Crédit invalide.');
       }
     }
 
@@ -2240,8 +2843,296 @@ class _HomeState extends State<Home> {
         }));
   }
 
-  Future<void> addCategory() async {
-    final result = await ask(context, 'Nouvelle catégorie', [
+  Future<void> addDue() async {
+    if (s.accounts.isEmpty) {
+      message('Ajoutez d’abord un compte de prélèvement.');
+      await addAccount();
+      return;
+    }
+    final result = await ask(context, 'Nouvelle échéance (prévu)', [
+      const Question('label', 'Libellé — ex. Électricité, carte 50 €'),
+      const Question('kind', 'Type', initial: 'bill', options: dueKinds),
+      const Question('total', 'Montant total en €', numeric: true),
+      Question(
+        'dueDate',
+        'Date d’échéance — AAAA-MM-JJ',
+        initial: dateText(DateTime.now()),
+      ),
+      Question(
+        'account',
+        'Compte de prélèvement',
+        initial: s.accounts.first.id,
+        options: {for (final a in s.accounts) a.id: a.name},
+      ),
+      const Question('scope', 'Périmètre', initial: 'personal', options: scopes),
+      Question(
+        'category',
+        'Catégorie (factures)',
+        initial: s.categories.first.id,
+        options: {
+          for (final c in s.categories)
+            c.id: '${iconNames[c.icon]?.split(' ').first ?? '🔷'} ${c.name}',
+        },
+      ),
+      const Question('recurrence', 'Récurrence',
+          initial: 'none', options: dueRecurrences),
+    ]);
+    if (result == null) return;
+    await run(() => s.change(() {
+          final kind = result['kind']!;
+          if (kind == 'card' && money(result['total']!) != 5000) {
+            // Rappel, pas blocage : le 50 € récurrent reste modifiable.
+            message('Rappel : remboursement carte habituel de 50 €.');
+          }
+          s.planDue(
+            label: result['label']!,
+            kind: kind,
+            total: money(result['total']!),
+            dueDate: parseDate(result['dueDate']!),
+            accountId: result['account']!,
+            scope: result['scope']!,
+            categoryId: result['category'],
+            recurrence: result['recurrence']!,
+          );
+        }));
+  }
+
+  Future<void> addLoan() async {
+    final liquidSources = s.accounts.where((a) => s.liquid(a)).toList();
+    if (liquidSources.isEmpty) {
+      message('Ajoutez d’abord un compte de prélèvement.');
+      await addAccount();
+      return;
+    }
+    final result = await ask(context, 'Nouveau crédit', [
+      const Question('name', 'Nom — ex. Maison, voiture'),
+      const Question('initial', 'Montant initial emprunté en €', numeric: true),
+      Question('start', 'Date de départ — AAAA-MM-JJ',
+          initial: dateText(DateTime.now())),
+      const Question('rate', 'Taux annuel en % — ex. 3,5', numeric: true),
+      const Question('months', 'Durée en mois — ex. 240', numeric: true),
+      const Question('monthly', 'Mensualité hors assurance en €', numeric: true),
+      const Question('insurance', 'Assurance mensuelle en €',
+          initial: '0', numeric: true),
+      const Question('fees', 'Frais mensuels en €', initial: '0', numeric: true),
+      Question('source', 'Compte de prélèvement',
+          initial: liquidSources.first.id,
+          options: {for (final a in liquidSources) a.id: a.name}),
+      const Question('scope', 'Périmètre', initial: 'personal', options: scopes),
+      const Question('resume', 'Crédit déjà commencé ? (oui/non)',
+          initial: 'non', optional: true),
+      const Question('remaining', 'Capital restant dû en € si reprise',
+          initial: '0', numeric: true, optional: true),
+      Question('remainingDate', 'Date du restant dû — AAAA-MM-JJ',
+          initial: dateText(DateTime.now()), optional: true),
+    ]);
+    if (result == null) return;
+    await run(() => s.change(() {
+          final resumed = result['resume']!.trim().toLowerCase() == 'oui';
+          s.planLoan(
+            name: result['name']!,
+            initialAmount: money(result['initial']!),
+            startDate: parseDate(result['start']!),
+            annualRate: double.parse(result['rate']!.replaceAll(',', '.')),
+            months: int.parse(result['months']!),
+            monthly: money(result['monthly']!),
+            insuranceMonthly: money(result['insurance']!),
+            feesMonthly: money(result['fees']!),
+            sourceAccountId: result['source']!,
+            scope: result['scope']!,
+            remainingDue: resumed ? money(result['remaining']!) : null,
+            remainingDate:
+                resumed && result['remainingDate']!.isNotEmpty
+                    ? parseDate(result['remainingDate']!)
+                    : null,
+          );
+        }));
+  }
+
+  Future<void> dueActions(Due d) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text('${d.label} — ${euro(d.total)}'),
+              subtitle: Text(
+                  '${dueKinds[d.kind]} · le ${dateText(d.dueDate)} · ${d.status}'),
+            ),
+            if (d.status == 'prévu')
+              ListTile(
+                leading: const Icon(Icons.check_circle, color: mint),
+                title: const Text('Comptabiliser à sa date'),
+                subtitle: const Text(
+                    'Crée les écritures (capital / intérêts / assurance / frais). Idempotent.'),
+                onTap: () => Navigator.pop(ctx, 'settle'),
+              ),
+            if (d.status == 'comptabilisé')
+              ListTile(
+                leading: const Icon(Icons.undo, color: violet),
+                title: const Text('Annuler la comptabilisation'),
+                onTap: () => Navigator.pop(ctx, 'cancel'),
+              ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('Supprimer'),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    switch (action) {
+      case 'settle':
+        final confirm = await ask(context, 'Comptabiliser ${d.label}', [
+          Question('date', 'Date comptable — AAAA-MM-JJ',
+              initial: dateText(d.dueDate.isAfter(DateTime.now())
+                  ? DateTime.now()
+                  : d.dueDate)),
+        ]);
+        if (confirm == null) return;
+        await run(() => s.change(() => s.settleDue(
+              dueId: d.id,
+              date: parseDate(confirm['date']!),
+            )));
+        break;
+      case 'cancel':
+        final yes = await confirmAction(
+          'Annuler la comptabilisation ?',
+          'Les écritures liées seront supprimées.',
+        );
+        if (yes) {
+          await run(() => s.change(() => s.cancelDueSettlement(d.id)));
+        }
+        break;
+      case 'delete':
+        final yes = await confirmAction(
+          'Supprimer cette échéance ?',
+          'Possible uniquement si elle n’est pas comptabilisée.',
+        );
+        if (yes) {
+          await run(() => s.change(() => s.deleteDue(d.id)));
+        }
+        break;
+    }
+  }
+
+  Widget duesSection() {
+    final upcoming = s.upcomingDues(scope: scopeFilter);
+    final settled = dues
+        .where((d) =>
+            d.status == 'comptabilisé' &&
+            (scopeFilter == 'all' || d.scope == scopeFilter))
+        .toList()
+      ..sort((a, b) => b.dueDate.compareTo(a.dueDate));
+    Widget dueTile(Due d) {
+      final statusColor =
+          d.status == 'comptabilisé' ? const Color(0xFF009A78) : violet;
+      return panel(
+        InkWell(
+          onTap: () => dueActions(d),
+          child: Row(
+            children: [
+              CircleAvatar(
+                backgroundColor: blue.withOpacity(.12),
+                child: Icon(
+                  d.kind == 'card'
+                      ? Icons.credit_card_rounded
+                      : d.kind == 'loan'
+                          ? Icons.home_work_outlined
+                          : Icons.receipt_long_rounded,
+                  color: blue,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('${d.label} — ${euro(d.total)}',
+                        style: const TextStyle(fontWeight: FontWeight.w800),
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    Text(
+                      '${dueKinds[d.kind]} · le ${dateText(d.dueDate)} · ${scopes[d.scope]}'
+                      '${d.recurrence == 'monthly' ? ' · mensuelle' : ''}',
+                      style: const TextStyle(
+                          fontSize: 12, color: Colors.black54),
+                      maxLines: 2, overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: statusColor.withOpacity(.12),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(d.status,
+                    style: TextStyle(
+                        color: statusColor, fontWeight: FontWeight.w700)),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        heading(
+          'Échéances — prévu / comptabilisé',
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                onPressed: addLoan,
+                tooltip: 'Nouveau crédit',
+                icon: const Icon(Icons.home_work_outlined, color: blue),
+              ),
+              IconButton(
+                onPressed: addDue,
+                icon: const Icon(Icons.add_circle, color: violet),
+              ),
+            ],
+          ),
+        ),
+        panel(const Text(
+          'Une échéance « prévu » ne modifie pas le solde réel. Comptabilisez-la à sa date : le compte source est débité du total, la dette baisse du capital, intérêts / assurance / frais passent en dépenses. DiPeSa enregistre : aucun paiement bancaire réel.',
+          style: TextStyle(fontSize: 12, color: Colors.black54),
+        )),
+        if (s.loans.isNotEmpty)
+          panel(Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Crédits suivis',
+                  style: TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              ...s.loans.map((l) {
+                int debt = 0;
+                try {
+                  debt = -s.balance(s.account(l.debtAccountId));
+                } catch (_) {}
+                return Text(
+                    '${l.name} : reste ${euro(debt)} · ${l.paidCount} mensualité(s) comptabilisée(s)');
+              }),
+            ],
+          )),
+        heading('À venir'),
+        if (upcoming.isEmpty) panel(const Text('Aucune échéance prévue.')),
+        ...upcoming.map(dueTile),
+        heading('Comptabilisées'),
+        if (settled.isEmpty) panel(const Text('Rien de comptabilisé.')),
+        ...settled.take(10).map(dueTile),
+      ],
+    );
+  }
+
+  Future<void> addCategory() async {    final result = await ask(context, 'Nouvelle catégorie', [
       const Question('name', 'Nom'),
       const Question('icon', 'Icône', options: iconNames),
       const Question('color', 'Couleur', options: colorNames),
@@ -3115,6 +4006,18 @@ class _HomeState extends State<Home> {
             ),
           );
         }),
+        duesSection(),
+        panel(Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Sorties de trésorerie — ${monthText(month)} : '
+                '${euro(s.cashOut(month, scope: scopeFilter))}'),
+            const Text(
+              'Dépenses + transferts sortants, dont le paiement total des crédits.',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ],
+        )),
       ],
     );
   }
