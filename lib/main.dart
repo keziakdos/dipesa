@@ -694,7 +694,7 @@ class _CapitalAppState extends State<CapitalApp>
     return MaterialApp(
       navigatorKey: navigator,
       debugShowCheckedModeBanner: false,
-      title: 'Mon Capital',
+      title: 'DiPeSa',
       locale: const Locale('fr'),
       supportedLocales: const [Locale('fr')],
       localizationsDelegates: GlobalMaterialLocalizations.delegates,
@@ -884,7 +884,7 @@ class _PinGateState extends State<PinGate> {
                   ),
                   const SizedBox(height: 24),
                   const Text(
-                    'Mon Capital',
+                    'DiPeSa',
                     style: TextStyle(
                       fontSize: 32,
                       fontWeight: FontWeight.w800,
@@ -2208,7 +2208,7 @@ class _HomeState extends State<Home> {
       }
 
       final accepted = await auth.authenticate(
-        localizedReason: 'Activer la biométrie pour Mon Capital',
+        localizedReason: 'Activer la biométrie pour DiPeSa',
         options: const AuthenticationOptions(biometricOnly: true),
       );
       if (accepted) {
@@ -2248,7 +2248,7 @@ class _HomeState extends State<Home> {
 
       final directory = await getTemporaryDirectory();
       final backup = File(
-        '${directory.path}/mon-capital-${DateTime.now().millisecondsSinceEpoch}.mcb',
+        '${directory.path}/dipesa-${DateTime.now().millisecondsSinceEpoch}.mcb',
       );
       await backup.writeAsString(jsonEncode(envelope), flush: true);
 
@@ -2256,7 +2256,7 @@ class _HomeState extends State<Home> {
       final box = context.findRenderObject() as RenderBox?;
       await Share.shareXFiles(
         [XFile(backup.path)],
-        text: 'Sauvegarde chiffrée Mon Capital',
+        text: 'Sauvegarde chiffrée DiPeSa',
         sharePositionOrigin:
             box == null ? null : box.localToGlobal(Offset.zero) & box.size,
       );
@@ -2281,7 +2281,7 @@ class _HomeState extends State<Home> {
 
       final envelope = jsonMap(jsonDecode(utf8.decode(bytes)));
       if (envelope['format'] != 'mon-capital-backup-1') {
-        throw Exception('Ce fichier n’est pas une sauvegarde Mon Capital.');
+        throw Exception('Ce fichier n’est pas une sauvegarde DiPeSa.');
       }
 
       if (!mounted) return;
@@ -2384,7 +2384,7 @@ class _HomeState extends State<Home> {
   @override
   Widget build(BuildContext context) {
     const titles = [
-      'Mon Capital',
+      'DiPeSa',
       'Mes comptes',
       'Mon budget',
       'Mes tirelires',

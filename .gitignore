@@ -46,3 +46,16 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# DiPeSa — données financières locales, sauvegardes et exports (ne jamais committer)
+*.mcb
+*.mcb.json
+budget.enc
+budget.enc.tmp
+**/budget.enc
+**/*.mcb
+/secrets/
+.env
+.env.*
+*.key
+*.pem
