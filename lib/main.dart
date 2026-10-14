@@ -3673,7 +3673,7 @@ class _HomeState extends State<Home> {
 
   Widget duesSection() {
     final upcoming = s.upcomingDues(scope: scopeFilter);
-    final settled = dues
+    final settled = s.dues
         .where((d) =>
             d.status == 'comptabilisé' &&
             (scopeFilter == 'all' || d.scope == scopeFilter))
