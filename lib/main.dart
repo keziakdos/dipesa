@@ -28,6 +28,22 @@ const accountTypes = <String, String>{
   'investment': 'Placement — valeur manuelle',
 };
 
+const scopes = <String, String>{
+  'personal': 'Personnel',
+  'joint': 'Commun',
+};
+
+const scopeFilters = <String, String>{
+  'all': 'Tout',
+  'personal': 'Personnel',
+  'joint': 'Commun',
+};
+
+const authors = <String, String>{
+  'me': 'Moi',
+  'wife': 'Ma femme',
+};
+
 const categoryIcons = <String, IconData>{
   'salary': Icons.work_rounded,
   'home': Icons.home_rounded,
@@ -209,17 +225,36 @@ class Account {
   final String name;
   final String type;
   final int limit;
+  final String scope;
+  final DateTime? initialDate;
 
-  Account(this.id, this.name, this.type, this.limit);
+  Account(
+    this.id,
+    this.name,
+    this.type,
+    this.limit, {
+    this.scope = 'personal',
+    this.initialDate,
+  });
 
-  Map<String, dynamic> toJson() =>
-      {'id': id, 'name': name, 'type': type, 'limit': limit};
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'type': type,
+        'limit': limit,
+        'scope': scope,
+        'initialDate': initialDate == null ? null : dateText(initialDate!),
+      };
 
   factory Account.fromJson(Map<String, dynamic> j) => Account(
         j['id'] as String,
         j['name'] as String,
         j['type'] as String,
         j['limit'] as int,
+        scope: (j['scope'] as String?) ?? 'personal',
+        initialDate: j['initialDate'] == null
+            ? null
+            : parseDate(j['initialDate'] as String),
       );
 }
 
@@ -252,6 +287,9 @@ class Entry {
   final int amount;
   final DateTime date;
   final String note;
+  final String scope;
+  final String author;
+  final String? contributionId;
 
   Entry({
     required this.id,
@@ -263,6 +301,9 @@ class Entry {
     this.category,
     this.project,
     this.note = '',
+    this.scope = 'personal',
+    this.author = 'me',
+    this.contributionId,
   });
 
   Map<String, dynamic> toJson() => {
@@ -275,6 +316,9 @@ class Entry {
         'amount': amount,
         'date': dateText(date),
         'note': note,
+        'scope': scope,
+        'author': author,
+        'contributionId': contributionId,
       };
 
   factory Entry.fromJson(Map<String, dynamic> j) => Entry(
@@ -286,7 +330,10 @@ class Entry {
         project: j['project'] as String?,
         amount: j['amount'] as int,
         date: parseDate(j['date'] as String),
-        note: j['note'] as String,
+        note: (j['note'] as String?) ?? '',
+        scope: (j['scope'] as String?) ?? 'personal',
+        author: (j['author'] as String?) ?? 'me',
+        contributionId: j['contributionId'] as String?,
       );
 }
 
@@ -346,6 +393,57 @@ class Allocation {
       );
 }
 
+class Contribution {
+  final String id;
+  final String person;
+  final int expected;
+  final int received;
+  final DateTime dueDate;
+  final DateTime? receivedDate;
+  final String status;
+  final String accountId;
+  final String? entryId;
+
+  Contribution({
+    required this.id,
+    required this.person,
+    required this.expected,
+    required this.received,
+    required this.dueDate,
+    this.receivedDate,
+    required this.status,
+    required this.accountId,
+    this.entryId,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'person': person,
+        'expected': expected,
+        'received': received,
+        'dueDate': dateText(dueDate),
+        'receivedDate':
+            receivedDate == null ? null : dateText(receivedDate!),
+        'status': status,
+        'accountId': accountId,
+        'entryId': entryId,
+      };
+
+  factory Contribution.fromJson(Map<String, dynamic> j) => Contribution(
+        id: j['id'] as String,
+        person: j['person'] as String,
+        expected: j['expected'] as int,
+        received: (j['received'] as int?) ?? 0,
+        dueDate: parseDate(j['dueDate'] as String),
+        receivedDate: j['receivedDate'] == null
+            ? null
+            : parseDate(j['receivedDate'] as String),
+        status: j['status'] as String,
+        accountId: j['accountId'] as String,
+        entryId: j['entryId'] as String?,
+      );
+}
+
 class BudgetStore extends ChangeNotifier {
   final FlutterSecureStorage secure = const FlutterSecureStorage();
 
@@ -357,6 +455,7 @@ class BudgetStore extends ChangeNotifier {
   List<Entry> entries = [];
   List<Project> projects = [];
   List<Allocation> allocations = [];
+  List<Contribution> contributions = [];
   Map<String, int> budgets = {};
 
   bool saving = false;
@@ -379,9 +478,17 @@ class BudgetStore extends ChangeNotifier {
     key = SecretKey(base64Decode(encodedKey));
 
     if (await file.exists()) {
-      final envelope = jsonMap(jsonDecode(await file.readAsString()));
+      // Protection P2 : copie chiffrée telle quelle avant toute migration.
+      final raw = await file.readAsString();
+      final envelope = jsonMap(jsonDecode(raw));
       final bytes = await decrypt(envelope, key);
-      load(jsonMap(jsonDecode(utf8.decode(bytes))));
+      final data = jsonMap(jsonDecode(utf8.decode(bytes)));
+      if ((data['version'] as int?) == 1) {
+        final backupFile =
+            File('${file.path}.bak-${DateTime.now().millisecondsSinceEpoch}');
+        await backupFile.writeAsString(raw, flush: true);
+      }
+      load(data);
       validate();
     } else {
       seed();
@@ -394,6 +501,7 @@ class BudgetStore extends ChangeNotifier {
     entries = [];
     projects = [];
     allocations = [];
+    contributions = [];
     budgets = {};
 
     categories = [
@@ -406,6 +514,7 @@ class BudgetStore extends ChangeNotifier {
       Category(id(), 'Santé', 'health', 'pink'),
       Category(id(), 'Sorties', 'outing', 'violet'),
       Category(id(), 'Cadeaux', 'gift', 'pink'),
+      Category(id(), 'Contribution au foyer', 'home', 'mint'),
       Category(id(), 'Intelligence artificielle', 'ai', 'violet'),
       Category(id(), 'Crédits et consommation API', 'api', 'violet'),
       Category(id(), 'Sites et hébergement', 'web', 'blue'),
@@ -416,30 +525,100 @@ class BudgetStore extends ChangeNotifier {
   }
 
   Map<String, dynamic> toJson() => {
-        'version': 1,
+        'version': 2,
         'accounts': accounts.map((e) => e.toJson()).toList(),
         'categories': categories.map((e) => e.toJson()).toList(),
         'entries': entries.map((e) => e.toJson()).toList(),
         'projects': projects.map((e) => e.toJson()).toList(),
         'allocations': allocations.map((e) => e.toJson()).toList(),
+        'contributions': contributions.map((e) => e.toJson()).toList(),
         'budgets': budgets,
       };
 
+  /// Migration v1 → v2 : ajoute scope/auteur, soldes initiaux datés,
+  /// catégorie « Contribution au foyer ». Ne supprime rien.
+  Map<String, dynamic> migrateV1ToV2(Map<String, dynamic> old) {
+    final accountsJson = (old['accounts'] as List)
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    final entriesJson = (old['entries'] as List)
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    var categoriesJson = (old['categories'] as List)
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+
+    if (!categoriesJson.any(
+        (c) => (c['name'] as String).toLowerCase() == 'contribution au foyer')) {
+      categoriesJson.add(Category(id(), 'Contribution au foyer', 'home', 'mint')
+          .toJson());
+    }
+
+    // Date de solde initial = date de la première écriture d'ajustement
+    // « Solde initial » du compte, si elle existe.
+    final initialByAccount = <String, String>{};
+    for (final e in entriesJson) {
+      if (e['kind'] == 'adjustment' &&
+          (e['note'] as String?) == 'Solde initial' &&
+          !initialByAccount.containsKey(e['account'])) {
+        initialByAccount[e['account'] as String] = e['date'] as String;
+      }
+    }
+    for (final a in accountsJson) {
+      a['scope'] = 'personal';
+      a['initialDate'] = initialByAccount[a['id']];
+    }
+    final scopeByAccount = {
+      for (final a in accountsJson) a['id'] as String: 'personal',
+    };
+    for (final e in entriesJson) {
+      e['scope'] = scopeByAccount[e['account']] ?? 'personal';
+      e['author'] = 'me';
+      e['contributionId'] = null;
+    }
+
+    return {
+      'version': 2,
+      'accounts': accountsJson,
+      'categories': categoriesJson,
+      'entries': entriesJson,
+      'projects': old['projects'],
+      'allocations': old['allocations'],
+      'contributions': [],
+      'budgets': old['budgets'],
+    };
+  }
+
   void load(Map<String, dynamic> j) {
-    if (j['version'] != 1) {
+    var data = j;
+    if (data['version'] == 1) {
+      data = migrateV1ToV2(data);
+    }
+    if (data['version'] != 2) {
       throw Exception('Version de sauvegarde non prise en charge.');
     }
-    accounts = (j['accounts'] as List)
+    accounts = (data['accounts'] as List)
         .map((e) => Account.fromJson(jsonMap(e))).toList();
-    categories = (j['categories'] as List)
+    categories = (data['categories'] as List)
         .map((e) => Category.fromJson(jsonMap(e))).toList();
-    entries = (j['entries'] as List)
+    entries = (data['entries'] as List)
         .map((e) => Entry.fromJson(jsonMap(e))).toList();
-    projects = (j['projects'] as List)
+    projects = (data['projects'] as List)
         .map((e) => Project.fromJson(jsonMap(e))).toList();
-    allocations = (j['allocations'] as List)
+    allocations = (data['allocations'] as List)
         .map((e) => Allocation.fromJson(jsonMap(e))).toList();
-    budgets = Map<String, int>.from(j['budgets'] as Map);
+    contributions = ((data['contributions'] as List?) ?? [])
+        .map((e) => Contribution.fromJson(jsonMap(e))).toList();
+    budgets = Map<String, int>.from(data['budgets'] as Map);
+    ensureHomeContributionCategory();
+  }
+
+  void ensureHomeContributionCategory() {
+    final exists = categories.any(
+        (c) => c.name.toLowerCase() == 'contribution au foyer');
+    if (!exists) {
+      categories.add(Category(id(), 'Contribution au foyer', 'home', 'mint'));
+    }
   }
 
   Future<void> save() async {
@@ -491,6 +670,16 @@ class BudgetStore extends ChangeNotifier {
 
   int get net => accounts.fold(0, (sum, a) => sum + balance(a));
 
+  Iterable<Account> inScope(String filter) =>
+      filter == 'all' ? accounts : accounts.where((a) => a.scope == filter);
+
+  int netFor(String filter) =>
+      inScope(filter).fold(0, (sum, a) => sum + balance(a));
+
+  int liquidFor(String filter) => inScope(filter)
+      .where(liquid)
+      .fold(0, (sum, a) => sum + balance(a));
+
   int get assets => accounts.fold(
         0, (sum, a) => sum + max(0, balance(a)),
       );
@@ -521,24 +710,49 @@ class BudgetStore extends ChangeNotifier {
 
   int get available => liquidTotal - totalReserved;
 
-  int monthly(String kind, DateTime month, {String? categoryId}) {
+  int monthly(
+    String kind,
+    DateTime month, {
+    String? categoryId,
+    String scope = 'all',
+    String? author,
+  }) {
     return entries
         .where((e) =>
             e.kind == kind &&
             sameMonth(e.date, month) &&
-            (categoryId == null || e.category == categoryId))
+            (categoryId == null || e.category == categoryId) &&
+            (scope == 'all' || e.scope == scope) &&
+            (author == null || e.author == author))
         .fold(0, (sum, e) => sum + e.amount);
   }
 
   int budget(DateTime month, [String categoryId = 'all']) =>
       budgets['${monthKey(month)}:$categoryId'] ?? 0;
 
-  List<Entry> history({String? accountId, String? projectId}) {
+  List<Entry> history({
+    String? accountId,
+    String? projectId,
+    String scope = 'all',
+    String? author,
+  }) {
     final result = entries.where((e) {
       if (accountId != null &&
           e.account != accountId &&
           e.destination != accountId) return false;
       if (projectId != null && e.project != projectId) return false;
+      if (scope != 'all') {
+        // Un transfert touche deux comptes : visible des deux côtés.
+        if (e.kind == 'transfer') {
+          final src = account(e.account).scope;
+          final dst =
+              e.destination == null ? src : account(e.destination!).scope;
+          if (src != scope && dst != scope) return false;
+        } else if (e.scope != scope) {
+          return false;
+        }
+      }
+      if (author != null && e.author != author) return false;
       return true;
     }).toList();
     result.sort((a, b) {
@@ -571,17 +785,23 @@ class BudgetStore extends ChangeNotifier {
     final accountIds = accounts.map((e) => e.id).toSet();
     final categoryIds = categories.map((e) => e.id).toSet();
     final projectIds = projects.map((e) => e.id).toSet();
+    final entryIds = entries.map((e) => e.id).toSet();
+    final contributionIds = contributions.map((e) => e.id).toSet();
 
     if (accountIds.length != accounts.length ||
         categoryIds.length != categories.length ||
         projectIds.length != projects.length ||
-        entries.map((e) => e.id).toSet().length != entries.length) {
+        entryIds.length != entries.length ||
+        contributionIds.length != contributions.length) {
       throw Exception('Identifiants dupliqués.');
     }
 
     for (final a in accounts) {
       if (!accountTypes.containsKey(a.type) || a.limit < 0) {
         throw Exception('Compte invalide.');
+      }
+      if (!scopes.containsKey(a.scope)) {
+        throw Exception('Périmètre de compte invalide.');
       }
       if (a.type == 'credit' && balance(a) < -a.limit) {
         throw Exception('Le plafond de la carte ${a.name} serait dépassé.');
@@ -593,6 +813,13 @@ class BudgetStore extends ChangeNotifier {
           !['income', 'expense', 'transfer', 'adjustment']
               .contains(e.kind)) {
         throw Exception('Opération invalide.');
+      }
+      if (!scopes.containsKey(e.scope) || !authors.containsKey(e.author)) {
+        throw Exception('Périmètre ou auteur invalide.');
+      }
+      if (e.contributionId != null &&
+          !contributionIds.contains(e.contributionId)) {
+        throw Exception('Contribution liée introuvable.');
       }
       if (e.kind != 'adjustment' && e.amount <= 0) {
         throw Exception('Le montant doit être supérieur à zéro.');
@@ -618,6 +845,28 @@ class BudgetStore extends ChangeNotifier {
       }
       if (e.date.isAfter(DateTime.now())) {
         throw Exception('Les opérations futures ne sont pas encore gérées.');
+      }
+    }
+
+    for (final c in contributions) {
+      if (!authors.containsKey(c.person) ||
+          !['attendu', 'partiel', 'reçu'].contains(c.status)) {
+        throw Exception('Contribution invalide.');
+      }
+      if (!accountIds.contains(c.accountId)) {
+        throw Exception('Compte commun de contribution introuvable.');
+      }
+      if (account(c.accountId).scope != 'joint') {
+        throw Exception('Une contribution doit cibler un compte commun.');
+      }
+      if (c.expected <= 0 || c.received < 0) {
+        throw Exception('Montants de contribution invalides.');
+      }
+      if (c.status == 'reçu' && c.received < c.expected) {
+        throw Exception('Contribution marquée reçue mais partielle.');
+      }
+      if (c.entryId != null && !entryIds.contains(c.entryId)) {
+        throw Exception('Écriture de contribution introuvable.');
       }
     }
 
@@ -1093,6 +1342,24 @@ class _HomeState extends State<Home> {
   BudgetStore get s => widget.store;
   int tab = 0;
   DateTime month = DateTime(DateTime.now().year, DateTime.now().month);
+  String scopeFilter = 'all';
+
+  String get scopeLabel =>
+      scopeFilter == 'all' ? 'Tous périmètres' : scopes[scopeFilter]!;
+
+  Widget scopeSelector() => Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: SegmentedButton<String>(
+          segments: const [
+            ButtonSegment(value: 'all', label: Text('Tout')),
+            ButtonSegment(value: 'personal', label: Text('Personnel')),
+            ButtonSegment(value: 'joint', label: Text('Commun')),
+          ],
+          selected: {scopeFilter},
+          onSelectionChanged: (selected) =>
+              setState(() => scopeFilter = selected.first),
+        ),
+      );
 
   void message(String text) {
     if (!mounted) return;
@@ -1197,11 +1464,17 @@ class _HomeState extends State<Home> {
     final result = await ask(context, 'Ajouter un compte', [
       const Question('name', 'Nom du compte'),
       const Question('type', 'Type', options: accountTypes),
+      const Question('scope', 'Périmètre', initial: 'personal', options: scopes),
       const Question(
         'balance',
         'Solde initial en € / montant dû si carte',
         initial: '0',
         numeric: true,
+      ),
+      Question(
+        'initialDate',
+        'Date du solde initial — AAAA-MM-JJ',
+        initial: dateText(DateTime.now()),
       ),
       const Question(
         'limit',
@@ -1222,15 +1495,32 @@ class _HomeState extends State<Home> {
             initial = -initial;
           }
 
-          final a = Account(id(), result['name']!, type, limit);
+          final scope = result['scope']!;
+          if (!scopes.containsKey(scope)) {
+            throw Exception('Périmètre invalide.');
+          }
+          final initialDate = parseDate(result['initialDate']!);
+          if (initialDate.isAfter(parseDate(dateText(DateTime.now())))) {
+            throw Exception('La date du solde initial ne peut pas être future.');
+          }
+
+          final a = Account(
+            id(),
+            result['name']!,
+            type,
+            limit,
+            scope: scope,
+            initialDate: initialDate,
+          );
           s.accounts.add(a);
           s.entries.add(Entry(
             id: id(),
             kind: 'adjustment',
             account: a.id,
             amount: initial,
-            date: DateTime.now(),
+            date: initialDate,
             note: 'Solde initial',
+            scope: scope,
           ));
         }));
   }
@@ -1288,6 +1578,20 @@ class _HomeState extends State<Home> {
                 p.id: '${p.name} — ${euro(s.reserved(p))}',
             },
           ),
+        if (kind != 'transfer') ...[
+          const Question(
+            'scope',
+            'Périmètre',
+            initial: 'personal',
+            options: scopes,
+          ),
+          const Question(
+            'author',
+            'Effectuée par',
+            initial: 'me',
+            options: authors,
+          ),
+        ],
         Question(
           'date',
           'Date — AAAA-MM-JJ',
@@ -1315,6 +1619,10 @@ class _HomeState extends State<Home> {
           }
 
           final project = result['project'];
+          final entryScope = kind == 'transfer'
+              ? s.account(result['destination']!).scope
+              : (result['scope'] ?? source.scope);
+          final entryAuthor = result['author'] ?? 'me';
           s.entries.add(Entry(
             id: id(),
             kind: kind,
@@ -1325,6 +1633,8 @@ class _HomeState extends State<Home> {
             amount: amount,
             date: parseDate(result['date']!),
             note: result['note'] ?? '',
+            scope: entryScope,
+            author: entryAuthor,
           ));
         }));
   }
@@ -1370,6 +1680,8 @@ class _HomeState extends State<Home> {
       dateText(e.date),
       s.account(e.account).name,
       if (transfer) '→ ${s.account(e.destination!).name}',
+      scopes[e.scope] ?? e.scope,
+      if (!transfer && !adjustment) authors[e.author] ?? e.author,
       if (e.note.isNotEmpty) e.note,
     ].join(' · ');
 
@@ -1450,6 +1762,9 @@ class _HomeState extends State<Home> {
               final items = s.history(
                 accountId: accountId,
                 projectId: projectId,
+                scope: accountId == null && projectId == null
+                    ? scopeFilter
+                    : 'all',
               );
               return ListView(
                 padding: const EdgeInsets.all(20),
@@ -1677,26 +1992,33 @@ class _HomeState extends State<Home> {
   }
 
   Widget dashboard() {
-    final expenses = s.monthly('expense', month);
-    final income = s.monthly('income', month);
+    final expenses = s.monthly('expense', month, scope: scopeFilter);
+    final income = s.monthly('income', month, scope: scopeFilter);
     final limit = s.budget(month);
 
     return Column(
       children: [
+        scopeSelector(),
         panel(
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('PATRIMOINE NET',
-                  style: TextStyle(letterSpacing: 1.5, color: ink)),
+              Text('ARGENT DISPONIBLE — $scopeLabel'.toUpperCase(),
+                  style:
+                      const TextStyle(letterSpacing: 1.5, color: ink)),
               const SizedBox(height: 8),
               Text(
-                euro(s.net),
+                euro(s.liquidFor(scopeFilter)),
                 style: const TextStyle(
                   fontSize: 34,
                   fontWeight: FontWeight.w800,
                   color: ink,
                 ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Périmètre : $scopeLabel · Personnel et Commun présentés séparément dans Comptes',
+                style: const TextStyle(fontSize: 12, color: Colors.black54),
               ),
               const SizedBox(height: 18),
               SizedBox(
@@ -1793,14 +2115,76 @@ class _HomeState extends State<Home> {
                     label: const Text('Ajouter un compte'),
                   ),
                 ]
-              : s.history().take(5).map((e) => entryTile(e)).toList(),
+              : s
+                    .history(scope: scopeFilter)
+                    .take(5)
+                    .map((e) => entryTile(e))
+                    .toList(),
         )),
       ],
     );
   }
 
-  Widget accountsPage() => Column(
+  Widget accountsPage() {
+    Widget accountCard(Account a) {
+      final balance = s.balance(a);
+      return panel(
+        InkWell(
+          onTap: () => accountActions(a),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  CircleAvatar(
+                    backgroundColor: blue.withOpacity(.12),
+                    child: Icon(accountIcon(a), color: blue),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(a.name,
+                            style: const TextStyle(
+                                fontWeight: FontWeight.w800)),
+                        Text(
+                            '${accountTypes[a.type]!} · ${scopes[a.scope] ?? ''}',
+                            style: const TextStyle(
+                                color: Colors.black54, fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                  Text(
+                    a.type == 'credit'
+                        ? '${euro(max(0, -balance))} dus'
+                        : euro(balance),
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ],
+              ),
+              if (a.type == 'credit') ...[
+                const SizedBox(height: 14),
+                progress(max(0, -balance), a.limit, violet),
+                const SizedBox(height: 8),
+                Text(
+                  'Plafond : ${euro(a.limit)} · '
+                  'Disponible : ${euro(a.limit + balance)}',
+                ),
+                if (balance > 0)
+                  Text('Solde créditeur : ${euro(balance)}'),
+              ],
+            ],
+          ),
+        ),
+      );
+    }
+
+    final personal = s.accounts.where((a) => a.scope == 'personal').toList();
+    final joint = s.accounts.where((a) => a.scope == 'joint').toList();
+
+    return Column(
         children: [
+          scopeSelector(),
           heading(
             'Mes comptes',
             trailing: IconButton(
@@ -1810,57 +2194,15 @@ class _HomeState extends State<Home> {
           ),
           if (s.accounts.isEmpty)
             panel(const Text('Ajoutez votre premier compte avec le bouton +.')),
-          ...s.accounts.map((a) {
-            final balance = s.balance(a);
-            return panel(
-              InkWell(
-                onTap: () => accountActions(a),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        CircleAvatar(
-                          backgroundColor: blue.withOpacity(.12),
-                          child: Icon(accountIcon(a), color: blue),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(a.name,
-                                  style: const TextStyle(
-                                      fontWeight: FontWeight.w800)),
-                              Text(accountTypes[a.type]!,
-                                  style: const TextStyle(
-                                      color: Colors.black54, fontSize: 12)),
-                            ],
-                          ),
-                        ),
-                        Text(
-                          a.type == 'credit'
-                              ? '${euro(max(0, -balance))} dus'
-                              : euro(balance),
-                          style: const TextStyle(fontWeight: FontWeight.w800),
-                        ),
-                      ],
-                    ),
-                    if (a.type == 'credit') ...[
-                      const SizedBox(height: 14),
-                      progress(max(0, -balance), a.limit, violet),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Plafond : ${euro(a.limit)} · '
-                        'Disponible : ${euro(a.limit + balance)}',
-                      ),
-                      if (balance > 0)
-                        Text('Solde créditeur : ${euro(balance)}'),
-                    ],
-                  ],
-                ),
-              ),
-            );
-          }),
+          heading('Personnel — ${euro(s.liquidFor('personal'))}'),
+          if (personal.isEmpty)
+            panel(const Text('Aucun compte personnel.')),
+          ...personal.map(accountCard),
+          heading('Commun — ${euro(s.liquidFor('joint'))}'),
+          if (joint.isEmpty)
+            panel(const Text(
+                'Aucun compte commun. Ajoutez-le avec le bouton + puis périmètre « Commun ».')),
+          ...joint.map(accountCard),
           panel(
             const Text(
               'Recharge de crédits API ou d’un site : créez un portefeuille '
@@ -1875,13 +2217,14 @@ class _HomeState extends State<Home> {
       );
 
   Widget budgetsPage() {
-    final total = s.monthly('expense', month);
+    final total = s.monthly('expense', month, scope: scopeFilter);
     final limit = s.budget(month);
     final previous = DateTime(month.year, month.month - 1);
-    final previousTotal = s.monthly('expense', previous);
+    final previousTotal = s.monthly('expense', previous, scope: scopeFilter);
 
     return Column(
       children: [
+        scopeSelector(),
         monthSelector(),
         panel(Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1905,10 +2248,12 @@ class _HomeState extends State<Home> {
               ? const Text('Aucune dépense pour cette période.')
               : Column(
                   children: s.categories.where((c) {
-                    return s.monthly('expense', month, categoryId: c.id) > 0;
+                    return s.monthly('expense', month,
+                            categoryId: c.id, scope: scopeFilter) >
+                        0;
                   }).map((c) {
-                    final amount =
-                        s.monthly('expense', month, categoryId: c.id);
+                    final amount = s.monthly('expense', month,
+                        categoryId: c.id, scope: scopeFilter);
                     return Padding(
                       padding: const EdgeInsets.only(bottom: 16),
                       child: Column(
@@ -1941,7 +2286,8 @@ class _HomeState extends State<Home> {
           ),
         ),
         ...s.categories.map((c) {
-          final spent = s.monthly('expense', month, categoryId: c.id);
+          final spent = s.monthly('expense', month,
+              categoryId: c.id, scope: scopeFilter);
           final budget = s.budget(month, c.id);
           return panel(
             InkWell(
