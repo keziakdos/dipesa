@@ -663,4 +663,74 @@ void main() {
       expect(backupFormats, contains(currentBackupFormat));
     });
   });
+
+  group('Import et rappels (phase 8)', () {
+    BudgetStore baseStore() {
+      final store = BudgetStore();
+      store.seed();
+      store.accounts.add(
+          Account('a1', 'Courant', 'bank', 0, scope: 'personal'));
+      store.entries.add(Entry(
+        id: 'e1',
+        kind: 'adjustment',
+        account: 'a1',
+        amount: 100000,
+        date: DateTime(2026, 9, 1),
+        scope: 'personal',
+      ));
+      return store;
+    }
+
+    test('aperçu : résumé + doublons', () {
+      final live = baseStore();
+      final doc = live.toJson();
+      final summary = BudgetStore.summarizeDoc(doc);
+      expect(summary['accounts'], 1);
+      expect(summary['entries'], 1);
+      expect(summary['net'], 100000);
+      final dups = live.duplicateCounts(doc);
+      expect(dups['entries'], 1);
+      expect(dups['accounts'], 1);
+    });
+
+    test('fusion : nouveautés ajoutées, doublons ignorés', () {
+      final live = baseStore();
+      final incoming = live.toJson();
+      // Doublon e1 + nouveauté e2.
+      (incoming['entries'] as List).add({
+        'id': 'e2',
+        'kind': 'income',
+        'account': 'a1',
+        'destination': null,
+        'category': live.categories.first.id,
+        'project': null,
+        'amount': 50000,
+        'date': '2026-10-02',
+        'note': '',
+        'scope': 'personal',
+        'author': 'me',
+        'contributionId': null,
+      });
+      live.mergeDoc(incoming);
+      live.validate();
+      expect(live.entries.length, 2);
+      expect(live.balance(live.account('a1')), 150000);
+      // Re-fusion du même fichier : rien ne bouge (anti-doublons).
+      live.mergeDoc(incoming);
+      expect(live.entries.length, 2);
+      expect(live.balance(live.account('a1')), 150000);
+    });
+
+    test('rappels : tous les 3 jours à heure fixe', () {
+      final now = DateTime(2026, 10, 14, 21, 30);
+      final dates = reminderDates(now, 20, 0, count: 4);
+      expect(dates.length, 4);
+      // 20h déjà passé → première demain, puis +3 jours.
+      expect(dates[0], DateTime(2026, 10, 15, 20, 0));
+      expect(dates[1], DateTime(2026, 10, 18, 20, 0));
+      expect(dates[3], DateTime(2026, 10, 24, 20, 0));
+      final morning = reminderDates(DateTime(2026, 10, 14, 8, 0), 20, 0);
+      expect(morning[0], DateTime(2026, 10, 14, 20, 0));
+    });
+  });
 }

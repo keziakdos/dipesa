@@ -7,11 +7,14 @@ import 'package:cryptography/cryptography.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:timezone/data/latest_all.dart' as tzdata;
+import 'package:timezone/timezone.dart' as tz;
 
 const blue = Color(0xFF49B6F5);
 const mint = Color(0xFF00CFA0);
@@ -229,6 +232,89 @@ String generateRecoveryCode() {
 
 String normalizeRecoveryCode(String input) =>
     input.toUpperCase().replaceAll(RegExp(r'[^A-Z2-9]'), '');
+
+/// Prochaines dates de rappel (tous les 3 jours à heure fixe).
+/// Fonction pure, testée. iOS peut différer l'affichage : l'ouverture
+/// de l'app replanifie les occurrences à venir.
+List<DateTime> reminderDates(DateTime now, int hour, int minute,
+    {int count = 10}) {
+  var first = DateTime(now.year, now.month, now.day, hour, minute);
+  if (!first.isAfter(now)) first = first.add(const Duration(days: 1));
+  return List.generate(
+      count, (i) => first.add(Duration(days: 3 * i)));
+}
+
+/// Rappels locaux « enregistrer vos dépenses » tous les 3 jours.
+/// Volontaire (opt-in), autorisation iOS demandée à l'activation, horaire
+/// réglable. Non testé sur appareil dans cet environnement.
+class ReminderService {
+  ReminderService(this.secure);
+
+  final FlutterSecureStorage secure;
+  final FlutterLocalNotificationsPlugin plugin =
+      FlutterLocalNotificationsPlugin();
+  bool _ready = false;
+
+  Future<void> init() async {
+    if (_ready) return;
+    tzdata.initializeTimeZones();
+    try {
+      tz.setLocalLocation(tz.getLocation('Europe/Paris'));
+    } catch (_) {}
+    const settings = InitializationSettings(
+      iOS: DarwinInitializationSettings(),
+    );
+    await plugin.initialize(settings);
+    _ready = true;
+  }
+
+  Future<bool> requestPermission() async {
+    await init();
+    final ios = plugin.resolvePlatformSpecificImplementation<
+        IOSFlutterLocalNotificationsPlugin>();
+    return await ios?.requestPermissions(
+          alert: true,
+          badge: true,
+          sound: true,
+        ) ??
+        false;
+  }
+
+  Future<void> schedule({required int hour, required int minute}) async {
+    await init();
+    await plugin.cancelAll();
+    const details = NotificationDetails(iOS: DarwinNotificationDetails());
+    final dates = reminderDates(DateTime.now(), hour, minute);
+    var n = 0;
+    for (final d in dates) {
+      await plugin.zonedSchedule(
+        1000 + n,
+        'DiPeSa — vos dépenses',
+        'Prenez 1 minute pour enregistrer vos dépenses du jour.',
+        tz.TZDateTime.from(d, tz.local),
+        details,
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      );
+      n++;
+    }
+    await secure.write(key: 'reminder-enabled', value: 'true');
+    await secure.write(key: 'reminder-hour', value: '$hour');
+    await secure.write(key: 'reminder-minute', value: '$minute');
+  }
+
+  Future<void> disable() async {
+    try {
+      await plugin.cancelAll();
+    } catch (_) {}
+    await secure.write(key: 'reminder-enabled', value: 'false');
+  }
+
+  Future<Map<String, String?>> prefs() async => {
+        'enabled': await secure.read(key: 'reminder-enabled'),
+        'hour': await secure.read(key: 'reminder-hour'),
+        'minute': await secure.read(key: 'reminder-minute'),
+      };
+}
 
 List<int> randomBytes(int length) {
   final random = Random.secure();
@@ -1731,6 +1817,112 @@ class BudgetStore extends ChangeNotifier {
     return {'capital': capital, 'interest': interest};
   }
 
+  /// Aperçu d'un document décodé (post-migration) avant import.
+  static Map<String, int> summarizeDoc(Map<String, dynamic> doc) {
+    int count(String key) => ((doc[key] as List?) ?? []).length;
+    var net = 0;
+    final impactByAccount = <String, int>{};
+    for (final raw in ((doc['entries'] as List?) ?? [])) {
+      final e = Map<String, dynamic>.from(raw as Map);
+      final amount = (e['amount'] as int?) ?? 0;
+      if (e['kind'] == 'transfer') {
+        impactByAccount[e['account'] as String] =
+            (impactByAccount[e['account'] as String] ?? 0) - amount;
+        final dst = e['destination'] as String?;
+        if (dst != null) {
+          impactByAccount[dst] =
+              (impactByAccount[dst] ?? 0) + amount;
+        }
+      } else if (e['account'] != null) {
+        final signed = e['kind'] == 'expense' ? -amount : amount;
+        impactByAccount[e['account'] as String] =
+            (impactByAccount[e['account'] as String] ?? 0) + signed;
+      }
+    }
+    for (final v in impactByAccount.values) {
+      net += v;
+    }
+    return {
+      'version': (doc['version'] as int?) ?? 0,
+      'accounts': count('accounts'),
+      'categories': count('categories'),
+      'entries': count('entries'),
+      'projects': count('projects'),
+      'contributions': count('contributions'),
+      'dues': count('dues'),
+      'loans': count('loans'),
+      'net': net,
+    };
+  }
+
+  /// Compte, par collection, les objets déjà présents (doublons ignorés en fusion).
+  Map<String, int> duplicateCounts(Map<String, dynamic> doc) {
+    int dups(String key, Set<String> live) {
+      var n = 0;
+      for (final raw in ((doc[key] as List?) ?? [])) {
+        final m = Map<String, dynamic>.from(raw as Map);
+        if (live.contains(m['id'])) n++;
+      }
+      return n;
+    }
+
+    final budgetKeys = ((doc['budgets'] as Map?) ?? {}).keys
+        .where((k) => budgets.containsKey(k))
+        .length;
+    return {
+      'accounts': dups('accounts', accounts.map((e) => e.id).toSet()),
+      'categories': dups('categories', categories.map((e) => e.id).toSet()),
+      'entries': dups('entries', entries.map((e) => e.id).toSet()),
+      'projects': dups('projects', projects.map((e) => e.id).toSet()),
+      'contributions':
+          dups('contributions', contributions.map((e) => e.id).toSet()),
+      'dues': dups('dues', dues.map((e) => e.id).toSet()),
+      'loans': dups('loans', loans.map((e) => e.id).toSet()),
+      'budgets': budgetKeys,
+    };
+  }
+
+  /// Fusion : ajoute uniquement les objets inconnus (anti-doublons par id),
+  /// les budgets entrants écrasent par clé. Atomique via change() + validate().
+  /// Les relations et identités des échéances sont conservées (ids intacts).
+  void mergeDoc(Map<String, dynamic> doc) {
+    void addNew<T>(
+        String key, Set<String> live, List<T> target, T Function(Map<String, dynamic>) parse) {
+      for (final raw in ((doc[key] as List?) ?? [])) {
+        final m = jsonMap(raw);
+        if (live.contains(m['id'])) continue;
+        target.add(parse(m));
+      }
+    }
+
+    addNew('accounts', accounts.map((e) => e.id).toSet(), accounts,
+        Account.fromJson);
+    addNew('categories', categories.map((e) => e.id).toSet(), categories,
+        Category.fromJson);
+    addNew('entries', entries.map((e) => e.id).toSet(), entries,
+        Entry.fromJson);
+    addNew('projects', projects.map((e) => e.id).toSet(), projects,
+        Project.fromJson);
+    addNew('contributions', contributions.map((e) => e.id).toSet(),
+        contributions, Contribution.fromJson);
+    addNew('dues', dues.map((e) => e.id).toSet(), dues, Due.fromJson);
+    addNew('loans', loans.map((e) => e.id).toSet(), loans, Loan.fromJson);
+    // Allocations sans id : anti-doublon par contenu (projet+montant+date).
+    final liveAllocs = allocations
+        .map((a) => '${a.project}|${a.amount}|${dateText(a.date)}')
+        .toSet();
+    for (final raw in ((doc['allocations'] as List?) ?? [])) {
+      final a = Allocation.fromJson(jsonMap(raw));
+      final key = '${a.project}|${a.amount}|${dateText(a.date)}';
+      if (liveAllocs.contains(key)) continue;
+      liveAllocs.add(key);
+      allocations.add(a);
+    }
+    final incoming = Map<String, int>.from((doc['budgets'] as Map?) ?? {});
+    budgets.addAll(incoming);
+    ensureHomeContributionCategory();
+  }
+
   List<Entry> history({
     String? accountId,
     String? projectId,
@@ -2734,6 +2926,12 @@ class _HomeState extends State<Home> {
   int tab = 0;
   DateTime month = DateTime(DateTime.now().year, DateTime.now().month);
   String scopeFilter = 'all';
+
+  @override
+  void initState() {
+    super.initState();
+    ensureReminder();
+  }
 
   String get scopeLabel =>
       scopeFilter == 'all' ? 'Tous périmètres' : scopes[scopeFilter]!;
@@ -4849,7 +5047,7 @@ class _HomeState extends State<Home> {
       ]);
       if (result == null) return;
 
-      Map<String, dynamic> restored;
+      Map<String, dynamic> decrypted;
       try {
         final backupKey = await passwordKey(
           result['password']!,
@@ -4859,21 +5057,84 @@ class _HomeState extends State<Home> {
           jsonMap(envelope['data']),
           backupKey,
         );
-        restored = jsonMap(jsonDecode(utf8.decode(plain)));
+        decrypted = jsonMap(jsonDecode(utf8.decode(plain)));
       } catch (_) {
         throw Exception('Mot de passe incorrect ou sauvegarde endommagée.');
       }
 
-      if (!mounted) return;
-      final confirmed = await confirmAction(
-        'Remplacer les données actuelles ?',
-        'La restauration remplace les comptes, opérations et projets '
-        'présents sur ce téléphone. Exportez-les d’abord si nécessaire.',
-      );
-      if (!confirmed) return;
+      // Validation + aperçu AVANT toute écriture (import atomique).
+      final probe = BudgetStore();
+      probe.load(decrypted);
+      probe.validate();
+      final summary = BudgetStore.summarizeDoc(decrypted);
+      final dups = s.duplicateCounts(decrypted);
 
-      await s.change(() => s.load(restored));
-      message('Sauvegarde restaurée.');
+      if (!mounted) return;
+      final mode = await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Aperçu de l’import'),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Format : ${envelope['format']}'),
+                Text(
+                    '${summary['accounts']} comptes · ${summary['entries']} opérations'),
+                Text(
+                    '${summary['categories']} catégories · ${summary['projects']} tirelires'),
+                Text(
+                    '${summary['contributions']} contributions · ${summary['dues']} échéances · ${summary['loans']} crédits'),
+                Text('Solde net du fichier : ${euro(summary['net']!)}'),
+                const Divider(),
+                Text(
+                    'Déjà présents (ignorés en fusion) : ${dups['entries']} opérations, ${dups['accounts']} comptes, ${dups['dues']} échéances.'),
+                const Text(
+                  'Fusion = ajoute les nouveautés sans doublon. Remplacement = snapshot actuel d’abord, puis remplace tout.',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Annuler'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, 'merge'),
+              child: const Text('Fusionner'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, 'replace'),
+              child: const Text('Remplacer'),
+            ),
+          ],
+        ),
+      );
+      if (mode == null || !mounted) return;
+
+      if (mode == 'merge') {
+        await s.change(() => s.mergeDoc(decrypted));
+        message('Import fusionné sans doublon.');
+      } else {
+        final confirmed = await confirmAction(
+          'Remplacer les données actuelles ?',
+          'Un snapshot de sécurité est créé avant. Exportez aussi en .mcb si besoin.',
+        );
+        if (!confirmed) return;
+        await s.snapshotIfDue();
+        try {
+          final dir = s.snapshotsDir();
+          await dir.create(recursive: true);
+          await File(s.file.path).copy(
+              '${dir.path}/pre-restore-${DateTime.now().millisecondsSinceEpoch}.enc');
+        } catch (_) {}
+        await s.change(() => s.load(decrypted));
+        message('Sauvegarde restaurée (remplacement).');
+      }
     });
   }
 
@@ -5079,8 +5340,85 @@ class _HomeState extends State<Home> {
     });
   }
 
-  Future<void> settings() async {
+  late final reminders = ReminderService(s.secure);
+
+  Future<void> ensureReminder() async {
+    try {
+      final p = await reminders.prefs();
+      if (p['enabled'] != 'true') return;
+      final h = int.tryParse(p['hour'] ?? '') ?? 20;
+      final m = int.tryParse(p['minute'] ?? '') ?? 0;
+      await reminders.schedule(hour: h, minute: m);
+    } catch (_) {}
+  }
+
+  Future<void> reminderSettings() async {
+    final p = await reminders.prefs();
+    final enabled = p['enabled'] == 'true';
+    final h = int.tryParse(p['hour'] ?? '') ?? 20;
+    final m = int.tryParse(p['minute'] ?? '') ?? 0;
+    if (!mounted) return;
     final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: const Text('Rappel tous les 3 jours',
+                  style: TextStyle(fontWeight: FontWeight.w800)),
+              subtitle: Text(enabled
+                  ? 'Activé · $h:${m.toString().padLeft(2, '0')}'
+                  : 'Désactivé · volontaire, autorisation iOS requise'),
+            ),
+            ListTile(
+              leading: Icon(
+                  enabled ? Icons.notifications_off : Icons.notifications),
+              title: Text(enabled ? 'Désactiver' : 'Activer'),
+              onTap: () => Navigator.pop(ctx, enabled ? 'off' : 'on'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.schedule),
+              title: const Text('Régler l’horaire'),
+              onTap: () => Navigator.pop(ctx, 'time'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'off') {
+      await run(() async => reminders.disable());
+      message('Rappels désactivés.');
+    } else if (action == 'on') {
+      final granted = await reminders.requestPermission();
+      if (!granted && mounted) {
+        message(
+            'Autorisez les notifications dans Réglages iOS pour recevoir les rappels.');
+      }
+      await run(
+          () async => reminders.schedule(hour: h, minute: m));
+      message('Rappel tous les 3 jours activé.');
+    } else if (action == 'time') {
+      final result = await ask(context, 'Horaire du rappel', [
+        Question('hour', 'Heure (0–23)', initial: '$h', numeric: true),
+        Question('minute', 'Minute (0–59)',
+            initial: m.toString().padLeft(2, '0'), numeric: true),
+      ]);
+      if (result == null) return;
+      await run(() async {
+        final nh = int.parse(result['hour']!);
+        final nm = int.parse(result['minute']!);
+        if (nh < 0 || nh > 23 || nm < 0 || nm > 59) {
+          throw Exception('Horaire invalide.');
+        }
+        await reminders.schedule(hour: nh, minute: nm);
+        message('Rappel réglé à $nh:${nm.toString().padLeft(2, '0')}.');
+      });
+    }
+  }
+
+  Future<void> settings() async {    final action = await showModalBottomSheet<String>(
       context: context,
       builder: (ctx) => SafeArea(
         child: Column(
@@ -5105,6 +5443,12 @@ class _HomeState extends State<Home> {
               leading: const Icon(Icons.pin_outlined),
               title: const Text('Changer le PIN (4 chiffres)'),
               onTap: () => Navigator.pop(ctx, 'pin'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.notifications_outlined),
+              title: const Text('Rappel dépenses tous les 3 jours'),
+              subtitle: const Text('Volontaire, horaire réglable'),
+              onTap: () => Navigator.pop(ctx, 'reminder'),
             ),
             ListTile(
               leading: const Icon(Icons.key_outlined),
@@ -5152,6 +5496,9 @@ class _HomeState extends State<Home> {
         break;
       case 'recovery':
         await regenerateRecovery();
+        break;
+      case 'reminder':
+        await reminderSettings();
         break;
       case 'export':
         await exportBackup();
