@@ -27,53 +27,42 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # 4a. Diagnostic rapide (quelques secondes, aide au dépannage).
-      - name: Diagnose build environment
+      # 4. Projet Xcode en signature manuelle + équipe factice (CI uniquement).
+      #    Avec le style Automatic, Xcode 17 tente de résoudre la signature
+      #    même quand elle est désactivée. En Manual + signature interdite,
+      #    aucune résolution n'est tentée. Sideloadly fera la vraie signature.
+      - name: Disable Xcode signing resolution (CI only)
         run: |
-          flutter --version
-          grep -n "assemble" "$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh" | head -20 || true
-          openssl version || true
-          which keytool java || true
-
-      # 4b. Prépare une fausse identité de signature LOCALE (CI uniquement).
-      #    Le Flutter récent exige un certificat + une équipe même pour un
-      #    build non signé. Un certificat auto-signé + une équipe factice
-      #    satisfont ces contrôles ; aucune signature réelle n'est produite
-      #    (--no-codesign) et Sideloadly signera avec le compte Apple gratuit.
-      #    Le P12 est généré via keytool (Java), bien mieux accepté par le
-      #    trousseau macOS que ceux d'OpenSSL 3.
-      - name: Prepare fake local signing identity (CI only)
-        run: |
-          CERT_PW="dipesa-ci"
-          security create-keychain -p "$CERT_PW" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-          security unlock-keychain -p "$CERT_PW" build.keychain
-          keytool -genkeypair -alias iphonedev -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=iPhone Developer, OU=DiPeSa, O=DiPeSa" -keystore /tmp/scert.p12 -storetype PKCS12 -storepass "$CERT_PW" -keypass "$CERT_PW"
-          security import /tmp/scert.p12 -k build.keychain -P "$CERT_PW" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CERT_PW" build.keychain || true
-          security list-keychains -d user -s ~/Library/Keychains/login.keychain-db build.keychain
-          security find-identity -v -p codesigning
           perl -pi -e 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = FAKE1234AB;/g' ios/Runner.xcodeproj/project.pbxproj
-          grep -n "DEVELOPMENT_TEAM" ios/Runner.xcodeproj/project.pbxproj | head
+          grep -c "DEVELOPMENT_TEAM" ios/Runner.xcodeproj/project.pbxproj
 
-      # 5. Compile l'application iOS SANS signature réelle.
+      # 5. Génère la config Xcode Flutter SANS les contrôles de signature.
+      #    (Le code source de Flutter le prouve : avec --no-codesign, aucun
+      #    contrôle de certificats/équipe ne s'exécute sur ce chemin.)
+      - name: Generate Flutter Xcode config (unsigned)
+        run: flutter build ios --release --no-codesign --config-only
+
+      # 6. Compile directement avec xcodebuild, signature désactivée.
+      #    Sortie complète visible : en cas d'échec, c'est la vraie erreur.
       - name: Build iOS Application (unsigned)
-        run: flutter build ios --release --no-codesign
+        run: xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/ios-unsigned CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGNING_IDENTITY="" build
 
-      # 6. Reconditionne en IPA non signé : Sideloadly le signera sur votre
+      # 7. Reconditionne en IPA non signé : Sideloadly le signera sur votre
       # PC avec votre compte Apple gratuit (aucun Mac requis).
       - name: Package unsigned IPA
         run: |
+          APP_PATH=$(find build/ios-unsigned/Build/Products/Release-iphoneos -maxdepth 1 -name "Runner.app" | head -n 1)
+          test -n "$APP_PATH"
           mkdir -p Payload
-          cp -R build/ios/iphoneos/Runner.app Payload/
+          cp -R "$APP_PATH" Payload/
           zip -r DiPeSa-unsigned.ipa Payload
 
-      # 7. Rend les livrables téléchargeables sur GitHub (onglet Actions)
+      # 8. Rend les livrables téléchargeables sur GitHub (onglet Actions)
       - name: Upload Runner artifact
         uses: actions/upload-artifact@v4
         with:
           name: Runner-app
-          path: build/ios/iphoneos/Runner.app
+          path: build/ios-unsigned/Build/Products/Release-iphoneos/Runner.app
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
