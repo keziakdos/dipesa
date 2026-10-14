@@ -27,33 +27,44 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # 4. Compile l'application iOS SANS signature (Sideloadly signera ensuite
-      #    avec un compte Apple gratuit).
-      #    `flutter build ios` exige désormais une équipe de signature même avec
-      #    --no-codesign : on génère la config Flutter puis on compile
-      #    directement avec xcodebuild, signature désactivée.
-      - name: Build iOS Application (unsigned)
+      # 4. Prépare une fausse identité de signature LOCALE (CI uniquement).
+      #    Le Flutter récent exige un certificat + une équipe même pour un
+      #    build non signé. Un certificat auto-signé + une équipe factice
+      #    satisfont ces contrôles ; aucune signature réelle n'est produite
+      #    (--no-codesign) et Sideloadly signera avec le compte Apple gratuit.
+      - name: Prepare fake local signing identity (CI only)
         run: |
-          flutter build ios --config-only
-          (cd ios && pod install)
-          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/ios-unsigned CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" build
+          CERT_PW="dipesa-ci"
+          security create-keychain -p "$CERT_PW" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security unlock-keychain -p "$CERT_PW" build.keychain
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/skey.pem -out /tmp/scert.pem -days 3650 -nodes -subj "/CN=iPhone Developer/"
+          openssl pkcs12 -export -out /tmp/scert.p12 -inkey /tmp/skey.pem -in /tmp/scert.pem -passout pass:"$CERT_PW"
+          security import /tmp/scert.p12 -k build.keychain -P "$CERT_PW" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CERT_PW" build.keychain || true
+          security list-keychains -d user -s ~/Library/Keychains/login.keychain-db build.keychain
+          security find-identity -v -p codesigning
+          perl -pi -e 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = FAKE1234AB;/g' ios/Runner.xcodeproj/project.pbxproj
+          grep -n "DEVELOPMENT_TEAM" ios/Runner.xcodeproj/project.pbxproj | head
 
-      # 5. Reconditionne en IPA non signé : Sideloadly le signera sur votre
+      # 5. Compile l'application iOS SANS signature réelle.
+      - name: Build iOS Application (unsigned)
+        run: flutter build ios --release --no-codesign
+
+      # 6. Reconditionne en IPA non signé : Sideloadly le signera sur votre
       # PC avec votre compte Apple gratuit (aucun Mac requis).
       - name: Package unsigned IPA
         run: |
-          APP_PATH=$(find build/ios-unsigned/Build/Products/Release-iphoneos -maxdepth 1 -name "Runner.app" | head -n 1)
-          test -n "$APP_PATH"
           mkdir -p Payload
-          cp -R "$APP_PATH" Payload/
+          cp -R build/ios/iphoneos/Runner.app Payload/
           zip -r DiPeSa-unsigned.ipa Payload
 
-      # 6. Rend les livrables téléchargeables sur GitHub (onglet Actions)
+      # 7. Rend les livrables téléchargeables sur GitHub (onglet Actions)
       - name: Upload Runner artifact
         uses: actions/upload-artifact@v4
         with:
           name: Runner-app
-          path: build/ios-unsigned/Build/Products/Release-iphoneos/Runner.app
+          path: build/ios/iphoneos/Runner.app
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
