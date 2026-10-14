@@ -27,19 +27,28 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # 4. Prépare une fausse identité de signature LOCALE (CI uniquement).
+      # 4a. Diagnostic rapide (quelques secondes, aide au dépannage).
+      - name: Diagnose build environment
+        run: |
+          flutter --version
+          grep -n "assemble" "$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh" | head -20 || true
+          openssl version || true
+          which keytool java || true
+
+      # 4b. Prépare une fausse identité de signature LOCALE (CI uniquement).
       #    Le Flutter récent exige un certificat + une équipe même pour un
       #    build non signé. Un certificat auto-signé + une équipe factice
       #    satisfont ces contrôles ; aucune signature réelle n'est produite
       #    (--no-codesign) et Sideloadly signera avec le compte Apple gratuit.
+      #    Le P12 est généré via keytool (Java), bien mieux accepté par le
+      #    trousseau macOS que ceux d'OpenSSL 3.
       - name: Prepare fake local signing identity (CI only)
         run: |
           CERT_PW="dipesa-ci"
           security create-keychain -p "$CERT_PW" build.keychain
           security set-keychain-settings -t 3600 -u build.keychain
           security unlock-keychain -p "$CERT_PW" build.keychain
-          openssl req -x509 -newkey rsa:2048 -keyout /tmp/skey.pem -out /tmp/scert.pem -days 3650 -nodes -subj "/CN=iPhone Developer/"
-          openssl pkcs12 -export -out /tmp/scert.p12 -inkey /tmp/skey.pem -in /tmp/scert.pem -passout pass:"$CERT_PW"
+          keytool -genkeypair -alias iphonedev -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=iPhone Developer, OU=DiPeSa, O=DiPeSa" -keystore /tmp/scert.p12 -storetype PKCS12 -storepass "$CERT_PW" -keypass "$CERT_PW"
           security import /tmp/scert.p12 -k build.keychain -P "$CERT_PW" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CERT_PW" build.keychain || true
           security list-keychains -d user -s ~/Library/Keychains/login.keychain-db build.keychain
