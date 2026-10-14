@@ -1106,11 +1106,11 @@ class BudgetStore extends ChangeNotifier {
       .fold(0, (sum, a) => sum + balance(a));
 
   int get assets => accounts.fold(
-        0, (sum, a) => sum + max(0, balance(a)),
+        0, (sum, a) => sum + max<int>(0, balance(a)),
       );
 
   int get debts => accounts.fold(
-        0, (sum, a) => sum + max(0, -balance(a)),
+        0, (sum, a) => sum + max<int>(0, -balance(a)),
       );
 
   bool liquid(Account a) =>
@@ -3431,7 +3431,7 @@ class _HomeState extends State<Home> {
               : 'Nouveau solde en €',
           initial: amountText(
             a.type == 'credit' || a.type == 'loan'
-                ? max(0, -s.balance(a))
+                ? max<int>(0, -s.balance(a))
                 : s.balance(a),
           ),
           numeric: true,
@@ -4411,7 +4411,7 @@ class _HomeState extends State<Home> {
                   ),
                   Text(
                     a.type == 'credit' || a.type == 'loan'
-                        ? '${euro(max(0, -balance))} dus'
+                        ? '${euro(max<int>(0, -balance))} dus'
                         : euro(balance),
                     style: const TextStyle(fontWeight: FontWeight.w800),
                   ),
@@ -4419,7 +4419,7 @@ class _HomeState extends State<Home> {
               ),
               if (a.type == 'credit') ...[
                 const SizedBox(height: 14),
-                progress(max(0, -balance), a.limit, violet),
+                progress(max<int>(0, -balance), a.limit, violet),
                 const SizedBox(height: 8),
                 Text(
                   'Plafond : ${euro(a.limit)} · '
@@ -4445,8 +4445,8 @@ class _HomeState extends State<Home> {
       int sum(String type) =>
           list.where((a) => a.type == type).fold(0, (x, a) => x + s.balance(a));
       return 'Courants : ${euro(sum('bank'))} · Épargne : ${euro(sum('savings'))} · '
-          'Espèces : ${euro(sum('cash'))} · Cartes dues : ${euro(max(0, -sum('credit')))} · '
-          'Crédits dus : ${euro(max(0, -sum('loan')))}';
+          'Espèces : ${euro(sum('cash'))} · Cartes dues : ${euro(max<int>(0, -sum('credit')))} · '
+          'Crédits dus : ${euro(max<int>(0, -sum('loan')))}';
     }
 
     List<Account> ordered(List<Account> list) {
@@ -4708,7 +4708,7 @@ class _HomeState extends State<Home> {
             final funded = s.funded(p);
             final spent = s.spent(p);
             final reserved = s.reserved(p);
-            final remaining = max(0, p.target - funded);
+            final remaining = max<int>(0, p.target - funded);
 
             var plan = 'Ajoutez de l’argent à votre rythme.';
             if (remaining == 0) {
