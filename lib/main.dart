@@ -4720,8 +4720,8 @@ class _HomeState extends State<Home> {
               if (days < 0) {
                 plan = 'Échéance dépassée · reste ${euro(remaining)}';
               } else {
-                final months = max(1, (days / 30.44).ceil());
-                final weeks = max(1, (days / 7).ceil());
+                final months = max<int>(1, (days / 30.44).ceil());
+                final weeks = max<int>(1, (days / 7).ceil());
                 plan =
                     '${euro((remaining / months).ceil())} / mois '
                     'ou ${euro((remaining / weeks).ceil())} / semaine';
